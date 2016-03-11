@@ -164,7 +164,7 @@ public:
     crush->straw_calc_version = 1;
   }
   void set_tunables_default() {
-    set_tunables_firefly();
+    set_tunables_bobtail();
     crush->straw_calc_version = 1;
   }
 
@@ -232,6 +232,7 @@ public:
       crush->chooseleaf_descend_once == 0 &&
       crush->chooseleaf_vary_r == 0 &&
       crush->chooseleaf_stable == 0 &&
+      crush->straw_calc_version == 0 &&
       crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
   }
   bool has_bobtail_tunables() const {
@@ -242,6 +243,7 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 0 &&
       crush->chooseleaf_stable == 0 &&
+      crush->straw_calc_version == 0 &&
       crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
   }
   bool has_firefly_tunables() const {
@@ -252,6 +254,7 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 1 &&
       crush->chooseleaf_stable == 0 &&
+      crush->straw_calc_version == 0 &&
       crush->allowed_bucket_algs == CRUSH_LEGACY_ALLOWED_BUCKET_ALGS;
   }
   bool has_hammer_tunables() const {
@@ -262,6 +265,7 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 1 &&
       crush->chooseleaf_stable == 0 &&
+      crush->straw_calc_version == 1 &&
       crush->allowed_bucket_algs == ((1 << CRUSH_BUCKET_UNIFORM) |
 				      (1 << CRUSH_BUCKET_LIST) |
 				      (1 << CRUSH_BUCKET_STRAW) |
@@ -275,6 +279,7 @@ public:
       crush->chooseleaf_descend_once == 1 &&
       crush->chooseleaf_vary_r == 1 &&
       crush->chooseleaf_stable == 1 &&
+      crush->straw_calc_version == 1 &&
       crush->allowed_bucket_algs == ((1 << CRUSH_BUCKET_UNIFORM) |
 				      (1 << CRUSH_BUCKET_LIST) |
 				      (1 << CRUSH_BUCKET_STRAW) |
@@ -315,19 +320,6 @@ public:
   bool is_v2_rule(unsigned ruleid) const;
   bool is_v3_rule(unsigned ruleid) const;
   bool is_v5_rule(unsigned ruleid) const;
-
-  string get_minimum_required_version() const {
-    if (has_v5_rules() || has_nondefault_tunables5())
-      return "jewel";
-    else if (has_v4_buckets())
-      return "hammer";
-    else if (has_nondefault_tunables3())
-      return "firefly";
-    else if (has_nondefault_tunables2() || has_nondefault_tunables())
-      return "bobtail";
-    else
-      return "argonaut";
-  }
 
   // default bucket types
   unsigned get_default_bucket_alg() const {
