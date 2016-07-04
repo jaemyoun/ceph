@@ -12,6 +12,7 @@
 #include "rgw_basic_types.h"
 #include "rgw_op.h"
 #include "rgw_sync.h"
+#include "rgw_orphan.h"
 
 #include "common/ceph_json.h"
 #include "common/Formatter.h"
@@ -45,7 +46,8 @@ void RGWOLHInfo::dump(Formatter *f) const
 
 void RGWOLHPendingInfo::dump(Formatter *f) const
 {
-  encode_json("time", time, f);
+  utime_t ut(time);
+  encode_json("time", ut, f);
 }
 
 void RGWObjManifestPart::dump(Formatter *f) const
@@ -136,6 +138,7 @@ void ACLGrant::dump(Formatter *f) const
 
   f->dump_string("name", name);
   f->dump_int("group", (int)group);
+  f->dump_string("url_spec", url_spec);
 }
 
 void RGWAccessControlList::dump(Formatter *f) const
@@ -188,7 +191,7 @@ void RGWAccessControlPolicy::dump(Formatter *f) const
 void ObjectMetaInfo::dump(Formatter *f) const
 {
   encode_json("size", size, f);
-  encode_json("mtime", mtime, f);
+  encode_json("mtime", utime_t(mtime), f);
 }
 
 void ObjectCacheInfo::dump(Formatter *f) const
@@ -486,14 +489,25 @@ void RGWUserInfo::decode_json(JSONObj *obj)
 void RGWQuotaInfo::dump(Formatter *f) const
 {
   f->dump_bool("enabled", enabled);
-  f->dump_int("max_size_kb", max_size_kb);
+  f->dump_bool("check_on_raw", check_on_raw);
+
+  f->dump_int("max_size", max_size);
+  f->dump_int("max_size_kb", rgw_rounded_kb(max_size));
   f->dump_int("max_objects", max_objects);
 }
 
 void RGWQuotaInfo::decode_json(JSONObj *obj)
 {
-  JSONDecoder::decode_json("max_size_kb", max_size_kb, obj);
+  if (false == JSONDecoder::decode_json("max_size", max_size, obj)) {
+    /* We're parsing an older version of the struct. */
+    int64_t max_size_kb = 0;
+
+    JSONDecoder::decode_json("max_size_kb", max_size_kb, obj);
+    max_size = max_size_kb * 1024;
+  }
   JSONDecoder::decode_json("max_objects", max_objects, obj);
+
+  JSONDecoder::decode_json("check_on_raw", check_on_raw, obj);
   JSONDecoder::decode_json("enabled", enabled, obj);
 }
 
@@ -520,7 +534,8 @@ void RGWBucketEntryPoint::dump(Formatter *f) const
 {
   encode_json("bucket", bucket, f);
   encode_json("owner", owner, f);
-  encode_json("creation_time", creation_time, f);
+  utime_t ut(creation_time);
+  encode_json("creation_time", ut, f);
   encode_json("linked", linked, f);
   encode_json("has_bucket_info", has_bucket_info, f);
   if (has_bucket_info) {
@@ -531,7 +546,8 @@ void RGWBucketEntryPoint::dump(Formatter *f) const
 void RGWBucketEntryPoint::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("bucket", bucket, obj);
   JSONDecoder::decode_json("owner", owner, obj);
-  JSONDecoder::decode_json("creation_time", creation_time, obj);
+  utime_t ut(creation_time);
+  JSONDecoder::decode_json("creation_time", ut, obj);
   JSONDecoder::decode_json("linked", linked, obj);
   JSONDecoder::decode_json("has_bucket_info", has_bucket_info, obj);
   if (has_bucket_info) {
@@ -541,8 +557,10 @@ void RGWBucketEntryPoint::decode_json(JSONObj *obj) {
 
 void RGWStorageStats::dump(Formatter *f) const
 {
-  encode_json("num_kb", num_kb, f);
-  encode_json("num_kb_rounded", num_kb_rounded, f);
+  encode_json("size", size, f);
+  encode_json("size_rounded", size_rounded, f);
+  encode_json("num_kb", rgw_rounded_kb(size), f);
+  encode_json("num_kb_rounded", rgw_rounded_kb(size_rounded), f);
   encode_json("num_objects", num_objects, f);
 }
 
@@ -623,7 +641,8 @@ void RGWBucketWebsiteConf::decode_json(JSONObj *obj) {
 void RGWBucketInfo::dump(Formatter *f) const
 {
   encode_json("bucket", bucket, f);
-  encode_json("creation_time", creation_time, f);
+  utime_t ut(creation_time);
+  encode_json("creation_time", ut, f);
   encode_json("owner", owner.to_str(), f);
   encode_json("flags", flags, f);
   encode_json("zonegroup", zonegroup, f);
@@ -643,7 +662,8 @@ void RGWBucketInfo::dump(Formatter *f) const
 
 void RGWBucketInfo::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("bucket", bucket, obj);
-  JSONDecoder::decode_json("creation_time", creation_time, obj);
+  utime_t ut(creation_time);
+  JSONDecoder::decode_json("creation_time", ut, obj);
   JSONDecoder::decode_json("owner", owner, obj);
   JSONDecoder::decode_json("flags", flags, obj);
   JSONDecoder::decode_json("zonegroup", zonegroup, obj);
@@ -681,7 +701,8 @@ void RGWObjEnt::dump(Formatter *f) const
   encode_json("owner", owner.to_str(), f);
   encode_json("owner_display_name", owner_display_name, f);
   encode_json("size", size, f);
-  encode_json("mtime", mtime, f);
+  utime_t ut(mtime);
+  encode_json("mtime", ut, f);
   encode_json("etag", etag, f);
   encode_json("content_type", content_type, f);
   encode_json("tag", tag, f);
@@ -693,7 +714,8 @@ void RGWBucketEnt::dump(Formatter *f) const
   encode_json("bucket", bucket, f);
   encode_json("size", size, f);
   encode_json("size_rounded", size_rounded, f);
-  encode_json("mtime", creation_time, f); /* mtime / creation time discrepency needed for backward compatibility */
+  utime_t ut(creation_time);
+  encode_json("mtime", ut, f); /* mtime / creation time discrepency needed for backward compatibility */
   encode_json("count", count, f);
 }
 
@@ -702,7 +724,8 @@ void RGWUploadPartInfo::dump(Formatter *f) const
   encode_json("num", num, f);
   encode_json("size", size, f);
   encode_json("etag", etag, f);
-  encode_json("modified", modified, f);
+  utime_t ut(modified);
+  encode_json("modified", ut, f);
 }
 
 void rgw_obj::dump(Formatter *f) const
@@ -1019,25 +1042,29 @@ void RGWZoneGroupMap::decode_json(JSONObj *obj)
 void RGWMetadataLogInfo::dump(Formatter *f) const
 {
   encode_json("marker", marker, f);
-  encode_json("last_update", last_update, f);
+  utime_t ut(last_update);
+  encode_json("last_update", ut, f);
 }
 
 void RGWMetadataLogInfo::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("marker", marker, obj);
-  JSONDecoder::decode_json("last_update", last_update, obj);
+  utime_t ut(last_update);
+  JSONDecoder::decode_json("last_update", ut, obj);
 }
 
 void RGWDataChangesLogInfo::dump(Formatter *f) const
 {
   encode_json("marker", marker, f);
-  encode_json("last_update", last_update, f);
+  utime_t ut(last_update);
+  encode_json("last_update", ut, f);
 }
 
 void RGWDataChangesLogInfo::decode_json(JSONObj *obj)
 {
   JSONDecoder::decode_json("marker", marker, obj);
-  JSONDecoder::decode_json("last_update", last_update, obj);
+  utime_t ut(last_update);
+  JSONDecoder::decode_json("last_update", ut, obj);
 }
 
 
@@ -1208,7 +1235,9 @@ void rgw_meta_sync_marker::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("next_step_marker", next_step_marker, obj);
   JSONDecoder::decode_json("total_entries", total_entries, obj);
   JSONDecoder::decode_json("pos", pos, obj);
-  JSONDecoder::decode_json("timestamp", timestamp, obj);
+  utime_t ut;
+  JSONDecoder::decode_json("timestamp", ut, obj);
+  timestamp = ut.to_real_time();
 }
 
 void rgw_meta_sync_marker::dump(Formatter *f) const
@@ -1218,7 +1247,7 @@ void rgw_meta_sync_marker::dump(Formatter *f) const
   encode_json("next_step_marker", next_step_marker, f);
   encode_json("total_entries", total_entries, f);
   encode_json("pos", pos, f);
-  encode_json("timestamp", timestamp, f);
+  encode_json("timestamp", utime_t(timestamp), f);
 }
 
 void rgw_meta_sync_status::decode_json(JSONObj *obj)
@@ -1282,5 +1311,53 @@ void KeystoneAdminTokenRequestVer3::dump(Formatter * const f) const
         f->close_section();
       f->close_section();
     f->close_section();
+  f->close_section();
+}
+
+
+void RGWOrphanSearchStage::dump(Formatter *f) const
+{
+  f->open_object_section("orphan_search_stage");
+  string s;
+  switch(stage){
+  case ORPHAN_SEARCH_STAGE_INIT:
+    s = "init";
+    break;
+  case ORPHAN_SEARCH_STAGE_LSPOOL:
+    s = "lspool";
+    break;
+  case ORPHAN_SEARCH_STAGE_LSBUCKETS:
+    s =  "lsbuckets";
+    break;
+  case ORPHAN_SEARCH_STAGE_ITERATE_BI:
+    s = "iterate_bucket_index";
+    break;
+  case ORPHAN_SEARCH_STAGE_COMPARE:
+    s = "comparing";
+    break;
+  default:
+    s = "unknown";
+  }
+  f->dump_string("search_stage", s);
+  f->dump_int("shard",shard);
+  f->dump_string("marker",marker);
+  f->close_section();
+}
+
+void RGWOrphanSearchInfo::dump(Formatter *f) const
+{
+  f->open_object_section("orphan_search_info");
+  f->dump_string("job_name", job_name);
+  f->dump_string("pool", pool);
+  f->dump_int("num_shards", num_shards);
+  encode_json("start_time", start_time, f);
+  f->close_section();
+}
+
+void RGWOrphanSearchState::dump(Formatter *f) const
+{
+  f->open_object_section("orphan_search_state");
+  encode_json("info", info, f);
+  encode_json("stage", stage, f);
   f->close_section();
 }

@@ -17,12 +17,8 @@
 #include <limits.h>
 
 #include "mon/Monitor.h"
-#include "mon/QuorumService.h"
 #include "mon/ConfigKeyService.h"
 #include "mon/MonitorDBStore.h"
-
-#include "common/config.h"
-#include "common/cmdparse.h"
 #include "common/errno.h"
 
 #define dout_subsys ceph_subsys_mon
@@ -49,7 +45,6 @@ void ConfigKeyService::get_store_prefixes(set<string>& s)
 
 void ConfigKeyService::store_put(string key, bufferlist &bl, Context *cb)
 {
-  bufferlist proposal_bl;
   MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
   t->put(STORE_PREFIX, key, bl);
   if (cb)
@@ -59,7 +54,6 @@ void ConfigKeyService::store_put(string key, bufferlist &bl, Context *cb)
 
 void ConfigKeyService::store_delete(string key, Context *cb)
 {
-  bufferlist proposal_bl;
   MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
   t->erase(STORE_PREFIX, key);
   if (cb)
@@ -160,7 +154,8 @@ bool ConfigKeyService::service_dispatch(MonOpRequestRef op)
     // return for now; we'll put the message once it's done.
     return true;
 
-  } else if (prefix == "config-key del") {
+  } else if (prefix == "config-key del" ||
+             prefix == "config-key rm") {
     if (!mon->is_leader()) {
       mon->forward_request_leader(op);
       return true;

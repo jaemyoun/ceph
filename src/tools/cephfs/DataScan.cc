@@ -177,6 +177,43 @@ int DataScan::main(const std::vector<const char*> &args)
     return -EINVAL;
   }
 
+  if (command == "tmap_upgrade") {
+    // Special case tmap_upgrade away from other modes, as this is a
+    // specialized command that will only exist in the Jewel series,
+    // and doesn't require the initialization of the `driver` member
+    // that is done below.
+    r = rados.connect();
+    if (r < 0) {
+      std::cerr << "couldn't connect to cluster: " << cpp_strerror(r)
+                << std::endl;
+      return r;
+    }
+
+    // Initialize metadata_io from pool on command line
+    if (metadata_pool_name.empty()) {
+      std::cerr << "Metadata pool not specified" << std::endl;
+      usage();
+      return -EINVAL;
+    }
+
+    long metadata_pool_id = rados.pool_lookup(metadata_pool_name.c_str());
+    if (metadata_pool_id < 0) {
+      std::cerr << "Pool '" << metadata_pool_name << "' not found!" << std::endl;
+      return -ENOENT;
+    } else {
+      dout(4) << "pool '" << metadata_pool_name
+        << "' has ID " << metadata_pool_id << dendl;
+    }
+
+    r = rados.ioctx_create(metadata_pool_name.c_str(), metadata_io);
+    if (r != 0) {
+      return r;
+    }
+    std::cerr << "Created ioctx for " << metadata_pool_name << std::endl;
+
+    return tmap_upgrade();
+  }
+
   // If caller didn't specify a namespace, try to pick
   // one if only one exists
   if (fscid == FS_CLUSTER_ID_NONE) {
@@ -199,7 +236,13 @@ int DataScan::main(const std::vector<const char*> &args)
   }
 
   dout(4) << "connecting to RADOS..." << dendl;
-  rados.connect();
+  r = rados.connect();
+  if (r < 0) {
+    std::cerr << "couldn't connect to cluster: " << cpp_strerror(r)
+              << std::endl;
+    return r;
+  }
+
   r = driver->init(rados, fsmap, fscid);
   if (r < 0) {
     return r;
@@ -246,7 +289,7 @@ int DataScan::main(const std::vector<const char*> &args)
       std::cerr << "Filesystem id " << fscid << " does not exist" << std::endl;
       return -ENOENT;
     }
-    int const metadata_pool_id = fs->mds_map.get_metadata_pool();
+    int64_t const metadata_pool_id = fs->mds_map.get_metadata_pool();
 
     dout(4) << "resolving metadata pool " << metadata_pool_id << dendl;
     std::string metadata_pool_name;
@@ -263,30 +306,6 @@ int DataScan::main(const std::vector<const char*> &args)
     }
   }
 
-  // Initialize metadata_io from pool on command line for tmap_upgrade
-  if (command == "tmap_upgrade") {
-    if (metadata_pool_name.empty()) {
-      std::cerr << "Metadata pool not specified" << std::endl;
-      usage();
-      return -EINVAL;
-    }
-
-    long metadata_pool_id = rados.pool_lookup(metadata_pool_name.c_str());
-    if (metadata_pool_id < 0) {
-      std::cerr << "Pool '" << metadata_pool_name << "' not found!" << std::endl;
-      return -ENOENT;
-    } else {
-      dout(4) << "pool '" << metadata_pool_name
-        << "' has ID " << metadata_pool_id << dendl;
-    }
-
-    r = rados.ioctx_create(metadata_pool_name.c_str(), metadata_io);
-    if (r != 0) {
-      return r;
-    }
-    std::cerr << "Created ioctx for " << metadata_pool_name << std::endl;
-  }
-
   // Finally, dispatch command
   if (command == "scan_inodes") {
     return scan_inodes();
@@ -294,8 +313,6 @@ int DataScan::main(const std::vector<const char*> &args)
     return scan_extents();
   } else if (command == "scan_frags") {
     return scan_frags();
-  } else if (command == "tmap_upgrade") {
-    return tmap_upgrade();
   } else if (command == "init") {
     return driver->init_roots(fs->mds_map.get_first_data_pool());
   } else {
@@ -328,9 +345,8 @@ int MetadataDriver::inject_unlinked_inode(
   inode.inode.version = 1;
   inode.inode.xattr_version = 1;
   inode.inode.mode = 0500 | mode;
-  // Fake size to 1, so that the directory doesn't appear to be empty
-  // (we won't actually give the *correct* size here though)
-  inode.inode.size = 1;
+  // Fake dirstat.nfiles to 1, so that the directory doesn't appear to be empty
+  // (we won't actually give the *correct* dirstat here though)
   inode.inode.dirstat.nfiles = 1;
 
   inode.inode.ctime = 
@@ -988,17 +1004,18 @@ int DataScan::scan_frags()
     if (r == -EINVAL) {
       derr << "Corrupt fnode on " << oid << dendl;
       if (force_corrupt) {
-        fnode.fragstat.mtime = 0;
-        fnode.fragstat.nfiles = 1;
-        fnode.fragstat.nsubdirs = 0;
+	fnode.fragstat.mtime = 0;
+	fnode.fragstat.nfiles = 1;
+	fnode.fragstat.nsubdirs = 0;
+	fnode.accounted_fragstat = fnode.fragstat;
       } else {
         return r;
       }
     }
 
     InodeStore dentry;
-    build_dir_dentry(obj_name_ino, fnode.fragstat.nfiles,
-        fnode.fragstat.mtime, loaded_layout, &dentry);
+    build_dir_dentry(obj_name_ino, fnode.accounted_fragstat,
+		loaded_layout, &dentry);
 
     // Inject inode to the metadata pool
     if (have_backtrace) {
@@ -1142,7 +1159,9 @@ int MetadataDriver::inject_lost_and_found(
     file_layout_t inherit_layout;
 
     // Construct LF inode
-    build_dir_dentry(CEPH_INO_LOST_AND_FOUND, 1, 0, inherit_layout, &lf_ino);
+    frag_info_t fragstat;
+    fragstat.nfiles = 1,
+    build_dir_dentry(CEPH_INO_LOST_AND_FOUND, fragstat, inherit_layout, &lf_ino);
 
     // Inject link to LF inode in the root dir
     r = inject_linkage(CEPH_INO_ROOT, "lost+found", frag_t(), lf_ino);
@@ -1415,7 +1434,6 @@ int MetadataDriver::inject_with_backtrace(
         // accurate, but it should avoid functional issues.
 
         ancestor_dentry.inode.dirstat.nfiles = 1;
-        ancestor_dentry.inode.size = 1;
 
         ancestor_dentry.inode.nlink = 1;
         ancestor_dentry.inode.ino = ino;
@@ -1472,6 +1490,9 @@ int MetadataDriver::find_or_create_dirfrag(
     bufferlist fnode_bl;
     fnode_t blank_fnode;
     blank_fnode.version = 1;
+    // mark it as non-empty
+    blank_fnode.fragstat.nfiles = 1;
+    blank_fnode.accounted_fragstat = blank_fnode.fragstat;
     blank_fnode.damage_flags |= (DAMAGE_STATS | DAMAGE_RSTATS);
     blank_fnode.encode(fnode_bl);
 
@@ -1566,7 +1587,7 @@ int MetadataDriver::init(
 {
   auto fs =  fsmap->get_filesystem(fscid);
   assert(fs != nullptr);
-  int const metadata_pool_id = fs->mds_map.get_metadata_pool();
+  int64_t const metadata_pool_id = fs->mds_map.get_metadata_pool();
 
   dout(4) << "resolving metadata pool " << metadata_pool_id << dendl;
   std::string metadata_pool_name;
@@ -1742,18 +1763,16 @@ void MetadataTool::build_file_dentry(
 }
 
 void MetadataTool::build_dir_dentry(
-    inodeno_t ino, uint64_t nfiles,
-    time_t mtime, const file_layout_t &layout, InodeStore *out)
+    inodeno_t ino, const frag_info_t &fragstat,
+    const file_layout_t &layout, InodeStore *out)
 {
   assert(out != NULL);
 
   out->inode.mode = 0755 | S_IFDIR;
-  out->inode.size = nfiles;
-  out->inode.dirstat.nfiles = nfiles;
-  out->inode.max_size_ever = nfiles;
-  out->inode.mtime.tv.tv_sec = mtime;
-  out->inode.atime.tv.tv_sec = mtime;
-  out->inode.ctime.tv.tv_sec = mtime;
+  out->inode.dirstat = fragstat;
+  out->inode.mtime.tv.tv_sec = fragstat.mtime;
+  out->inode.atime.tv.tv_sec = fragstat.mtime;
+  out->inode.ctime.tv.tv_sec = fragstat.mtime;
 
   out->inode.layout = layout;
 

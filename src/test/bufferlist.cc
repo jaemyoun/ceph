@@ -638,6 +638,17 @@ TEST(BufferPtr, is_n_page_sized) {
   }
 }
 
+TEST(BufferPtr, is_partial) {
+  bufferptr a;
+  EXPECT_FALSE(a.is_partial());
+  bufferptr b(10);
+  EXPECT_FALSE(b.is_partial());
+  bufferptr c(b, 1, 9);
+  EXPECT_TRUE(c.is_partial());
+  bufferptr d(b, 0, 9);
+  EXPECT_TRUE(d.is_partial());
+}
+
 TEST(BufferPtr, accessors) {
   unsigned len = 17;
   bufferptr ptr(len);
@@ -752,7 +763,7 @@ TEST(BufferPtr, copy_out_bench) {
     }
     utime_t end = ceph_clock_now(NULL);
     cout << count << " fills of buffer len " << buflen
-	 << " with " << s << " byte copy_in in "
+	 << " with " << s << " byte copy_out in"
 	 << (end - start) << std::endl;
   }
 }
@@ -933,6 +944,18 @@ TEST(BufferListIterator, constructors) {
     j.advance(-1);
     EXPECT_EQ('X', *j);
   }
+
+  //
+  // const_iterator(const iterator& other)
+  //
+  {
+    bufferlist bl;
+    bl.append("ABC", 3);
+    bufferlist::iterator i(&bl);
+    bufferlist::const_iterator ci(i);
+    EXPECT_EQ(0u, ci.get_off());
+    EXPECT_EQ('A', *ci);
+  }
 }
 
 TEST(BufferListIterator, empty_create_append_copy) {
@@ -946,7 +969,7 @@ TEST(BufferListIterator, empty_create_append_copy) {
   ASSERT_TRUE(out.contents_equal(bl));
 }
 
-TEST(BufferListIterator, operator_equal) {
+TEST(BufferListIterator, operator_assign) {
   bufferlist bl;
   bl.append("ABC", 3);
   bufferlist::iterator i(&bl, 1);
@@ -1014,6 +1037,65 @@ TEST(BufferListIterator, advance) {
   }
 }
 
+TEST(BufferListIterator, get_ptr_and_advance)
+{
+  bufferptr a("one", 3);
+  bufferptr b("two", 3);
+  bufferptr c("three", 5);
+  bufferlist bl;
+  bl.append(a);
+  bl.append(b);
+  bl.append(c);
+  const char *ptr;
+  bufferlist::iterator p = bl.begin();
+  ASSERT_EQ(3u, p.get_ptr_and_advance(11, &ptr));
+  ASSERT_EQ(bl.length() - 3u, p.get_remaining());
+  ASSERT_EQ(0, memcmp(ptr, "one", 3));
+  ASSERT_EQ(2u, p.get_ptr_and_advance(2, &ptr));
+  ASSERT_EQ(0, memcmp(ptr, "tw", 2));
+  ASSERT_EQ(1u, p.get_ptr_and_advance(4, &ptr));
+  ASSERT_EQ(0, memcmp(ptr, "o", 1));
+  ASSERT_EQ(5u, p.get_ptr_and_advance(5, &ptr));
+  ASSERT_EQ(0, memcmp(ptr, "three", 5));
+  ASSERT_EQ(0u, p.get_remaining());
+}
+
+TEST(BufferListIterator, iterator_crc32c) {
+  bufferlist bl1;
+  bufferlist bl2;
+  bufferlist bl3;
+
+  string s1(100, 'a');
+  string s2(50, 'b');
+  string s3(7, 'c');
+  string s;
+  bl1.append(s1);
+  bl1.append(s2);
+  bl1.append(s3);
+  s = s1 + s2 + s3;
+  bl2.append(s);
+
+  bufferlist::iterator it = bl2.begin();
+  ASSERT_EQ(bl1.crc32c(0), it.crc32c(it.get_remaining(), 0));
+  ASSERT_EQ(0u, it.get_remaining());
+
+  it = bl1.begin();
+  ASSERT_EQ(bl2.crc32c(0), it.crc32c(it.get_remaining(), 0));
+
+  bl3.append(s.substr(98, 55));
+  it = bl1.begin();
+  it.advance(98);
+  ASSERT_EQ(bl3.crc32c(0), it.crc32c(55, 0));
+  ASSERT_EQ(4u, it.get_remaining());
+
+  bl3.clear();
+  bl3.append(s.substr(98 + 55));
+  it = bl1.begin();
+  it.advance(98 + 55);
+  ASSERT_EQ(bl3.crc32c(0), it.crc32c(10, 0));
+  ASSERT_EQ(0u, it.get_remaining());
+}
+
 TEST(BufferListIterator, seek) {
   bufferlist bl;
   bl.append("ABC", 3);
@@ -1038,6 +1120,49 @@ TEST(BufferListIterator, operator_star) {
   }
 }
 
+TEST(BufferListIterator, operator_equal) {
+  bufferlist bl;
+  bl.append("ABC", 3);
+  {
+    bufferlist::iterator i(&bl);
+    bufferlist::iterator j(&bl);
+    EXPECT_EQ(i, j);
+  }
+  {
+    bufferlist::const_iterator ci = bl.begin();
+    bufferlist::iterator i = bl.begin();
+    EXPECT_EQ(i, ci);
+    EXPECT_EQ(ci, i);
+  }
+}
+
+TEST(BufferListIterator, operator_nequal) {
+  bufferlist bl;
+  bl.append("ABC", 3);
+  {
+    bufferlist::iterator i(&bl);
+    bufferlist::iterator j(&bl);
+    EXPECT_NE(++i, j);
+  }
+  {
+    bufferlist::const_iterator ci = bl.begin();
+    bufferlist::const_iterator cj = bl.begin();
+    ++ci;
+    EXPECT_NE(ci, cj);
+    bufferlist::iterator i = bl.begin();
+    EXPECT_NE(i, ci);
+    EXPECT_NE(ci, i);
+  }
+  {
+    // tests begin(), end(), operator++() also
+    string s("ABC");
+    int i = 0;
+    for (auto c : bl) {
+      EXPECT_EQ(s[i++], c);
+    }
+  }
+}
+
 TEST(BufferListIterator, operator_plus_plus) {
   bufferlist bl;
   {
@@ -1049,7 +1174,7 @@ TEST(BufferListIterator, operator_plus_plus) {
     bufferlist::iterator i(&bl);
     ++i;
     EXPECT_EQ('B', *i);
-  }  
+  }
 }
 
 TEST(BufferListIterator, get_current_ptr) {
@@ -1159,6 +1284,21 @@ TEST(BufferListIterator, copy) {
     EXPECT_EQ('C', copy[4]);
     EXPECT_EQ((unsigned)(2 + 3), copy.length());
   }
+}
+
+TEST(BufferListIterator, copy_huge) {
+  constexpr unsigned len = 2268888894U;
+  static_assert(int(len) < 0,
+		"should be a number underflows when being casted to int.");
+  bufferptr ptr(buffer::create_dummy());
+  ptr.set_length(len);
+
+  bufferlist src, dest;
+  src.append(ptr);
+  auto bp = src.begin();
+  bp.copy(len, dest);
+  // contents_equal() is not for this test
+  EXPECT_EQ(len, dest.length());
 }
 
 TEST(BufferListIterator, copy_in) {
@@ -1322,6 +1462,24 @@ TEST(BufferList, buffers) {
   ASSERT_EQ((unsigned)0, bl.get_num_buffers());
   bl.append('A');
   ASSERT_EQ((unsigned)1, bl.get_num_buffers());
+}
+
+TEST(BufferList, to_str) {
+  {
+    bufferlist bl;
+    bl.append("foo");
+    ASSERT_EQ(bl.to_str(), string("foo"));
+  }
+  {
+    bufferptr a("foobarbaz", 9);
+    bufferptr b("123456789", 9);
+    bufferptr c("ABCDEFGHI", 9);
+    bufferlist bl;
+    bl.append(a);
+    bl.append(b);
+    bl.append(c);
+    ASSERT_EQ(bl.to_str(), string("foobarbaz123456789ABCDEFGHI"));
+  }
 }
 
 TEST(BufferList, get_contiguous) {

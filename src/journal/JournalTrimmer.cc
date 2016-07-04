@@ -27,10 +27,24 @@ JournalTrimmer::JournalTrimmer(librados::IoCtx &ioctx,
 }
 
 JournalTrimmer::~JournalTrimmer() {
+  assert(m_shutdown);
+}
+
+void JournalTrimmer::shut_down(Context *on_finish) {
+  ldout(m_cct, 20) << __func__ << dendl;
+  {
+    Mutex::Locker locker(m_lock);
+    assert(!m_shutdown);
+    m_shutdown = true;
+  }
+
   m_journal_metadata->remove_listener(&m_metadata_listener);
 
-  m_journal_metadata->flush_commit_position();
-  m_async_op_tracker.wait_for_ops();
+  // chain the shut down sequence (reverse order)
+  on_finish = new FunctionContext([this, on_finish](int r) {
+      m_async_op_tracker.wait_for_ops(on_finish);
+    });
+  m_journal_metadata->flush_commit_position(on_finish);
 }
 
 int JournalTrimmer::remove_objects(bool force) {
@@ -194,7 +208,8 @@ JournalTrimmer::C_RemoveSet::C_RemoveSet(JournalTrimmer *_journal_trimmer,
 
 void JournalTrimmer::C_RemoveSet::complete(int r) {
   lock.Lock();
-  if (r < 0 && r != -ENOENT && return_value == -ENOENT) {
+  if (r < 0 && r != -ENOENT &&
+      (return_value == -ENOENT || return_value == 0)) {
     return_value = r;
   } else if (r == 0 && return_value == -ENOENT) {
     return_value = 0;

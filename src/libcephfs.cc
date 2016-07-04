@@ -231,6 +231,11 @@ public:
     return cwd.c_str();
   }
 
+  int chdir(const char *to)
+  {
+    return client->chdir(to, cwd);
+  }
+
   CephContext *get_ceph_context() const {
     return cct;
   }
@@ -454,7 +459,7 @@ extern "C" int ceph_chdir (struct ceph_mount_info *cmount, const char *s)
 {
   if (!cmount->is_mounted())
     return -ENOTCONN;
-  return cmount->get_client()->chdir(s);
+  return cmount->chdir(s);
 }
 
 extern "C" int ceph_opendir(struct ceph_mount_info *cmount,
@@ -476,7 +481,7 @@ extern "C" struct dirent * ceph_readdir(struct ceph_mount_info *cmount, struct c
 {
   if (!cmount->is_mounted()) {
     /* Client::readdir also sets errno to signal errors. */
-    errno = -ENOTCONN;
+    errno = ENOTCONN;
     return NULL;
   }
   return cmount->get_client()->readdir(reinterpret_cast<dir_result_t*>(dirp));
@@ -1213,7 +1218,7 @@ extern "C" int ceph_get_osd_addr(struct ceph_mount_info *cmount, int osd,
   if (ret < 0)
     return ret;
 
-  memcpy(addr, &address.ss_addr(), sizeof(*addr));
+  *addr = address.get_sockaddr_storage();
 
   return 0;
 }
@@ -1236,7 +1241,7 @@ extern "C" int ceph_get_file_stripe_address(struct ceph_mount_info *cmount, int 
     return r;
 
   for (i = 0; i < (unsigned)naddr && i < address.size(); i++)
-    memcpy(&addr[i], &address[i].ss_addr(), sizeof(*addr));
+    addr[i] = address[i].get_sockaddr_storage();
 
   /* naddr == 0: drop through and return actual size */
   if (naddr && (address.size() > (unsigned)naddr))
@@ -1314,7 +1319,7 @@ extern "C" int ceph_ll_lookup_root(struct ceph_mount_info *cmount,
   *parent = cmount->get_client()->get_root();
   if (*parent)
     return 0;
-  return EFAULT;
+  return -EFAULT;
 }
 
 extern "C" struct Inode *ceph_ll_get_inode(class ceph_mount_info *cmount,
@@ -1508,6 +1513,15 @@ extern "C" int ceph_ll_create(class ceph_mount_info *cmount,
 {
   return (cmount->get_client())->ll_create(parent, name, mode, flags,
 					   attr, out, fhp, uid, gid);
+}
+
+extern "C" int ceph_ll_mknod(class ceph_mount_info *cmount,
+			     struct Inode *parent, const char *name,
+			     mode_t mode, dev_t rdev, struct stat *attr,
+			     struct Inode **out, int uid, int gid)
+{
+  return (cmount->get_client())->ll_mknod(parent, name, mode, rdev,
+					  attr, out, uid, gid);
 }
 
 extern "C" int ceph_ll_mkdir(class ceph_mount_info *cmount,

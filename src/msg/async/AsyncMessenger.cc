@@ -50,10 +50,27 @@ static ostream& _prefix(std::ostream *_dout, WorkerPool *p) {
 }
 
 
-
 /*******************
  * Processor
  */
+
+class Processor::C_processor_accept : public EventCallback {
+  Processor *pro;
+
+ public:
+  explicit C_processor_accept(Processor *p): pro(p) {}
+  void do_request(int id) {
+    pro->accept();
+  }
+};
+
+Processor::Processor(AsyncMessenger *r, CephContext *c, uint64_t n)
+  : msgr(r),
+  net(c),
+  worker(NULL),
+  listen_sd(-1),
+  nonce(n),
+  listen_handler(new C_processor_accept(this)) {}
 
 int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
 {
@@ -85,7 +102,7 @@ int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
   if (r < 0) {
     ::close(listen_sd);
     listen_sd = -1;
-    return -errno;
+    return r;
   }
 
   net.set_socket_options(listen_sd);
@@ -116,9 +133,10 @@ int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
         continue;
       }
 
-      rc = ::bind(listen_sd, (struct sockaddr *) &listen_addr.ss_addr(), listen_addr.addr_size());
+      rc = ::bind(listen_sd, listen_addr.get_sockaddr(),
+		  listen_addr.get_sockaddr_len());
       if (rc < 0) {
-        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr.ss_addr()
+        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr
                          << ": " << cpp_strerror(errno) << dendl;
         r = -errno;
         continue;
@@ -130,12 +148,13 @@ int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
           continue;
 
         listen_addr.set_port(port);
-        rc = ::bind(listen_sd, (struct sockaddr *) &listen_addr.ss_addr(), listen_addr.addr_size());
+        rc = ::bind(listen_sd, listen_addr.get_sockaddr(),
+		    listen_addr.get_sockaddr_len());
         if (rc == 0)
           break;
       }
       if (rc < 0) {
-        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr.ss_addr()
+        lderr(msgr->cct) << __func__ << " unable to bind to " << listen_addr
                          << " on any port in range " << msgr->cct->_conf->ms_bind_port_min
                          << "-" << msgr->cct->_conf->ms_bind_port_max << ": "
                          << cpp_strerror(errno) << dendl;
@@ -158,8 +177,9 @@ int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
   }
 
   // what port did we get?
-  socklen_t llen = sizeof(listen_addr.ss_addr());
-  rc = getsockname(listen_sd, (sockaddr*)&listen_addr.ss_addr(), &llen);
+  sockaddr_storage ss;
+  socklen_t llen = sizeof(ss);
+  rc = getsockname(listen_sd, (sockaddr*)&ss, &llen);
   if (rc < 0) {
     rc = -errno;
     lderr(msgr->cct) << __func__ << " failed getsockname: " << cpp_strerror(rc) << dendl;
@@ -167,6 +187,7 @@ int Processor::bind(const entity_addr_t &bind_addr, const set<int>& avoid_ports)
     listen_sd = -1;
     return rc;
   }
+  listen_addr.set_sockaddr((sockaddr*)&ss);
 
   ldout(msgr->cct, 10) << __func__ << " bound to " << listen_addr << dendl;
 
@@ -232,13 +253,11 @@ int Processor::start(Worker *w)
 void Processor::accept()
 {
   ldout(msgr->cct, 10) << __func__ << " listen_sd=" << listen_sd << dendl;
-  int errors = 0;
-  while (errors < 4) {
-    entity_addr_t addr;
-    socklen_t slen = sizeof(addr.ss_addr());
-    int sd = ::accept(listen_sd, (sockaddr*)&addr.ss_addr(), &slen);
+  while (true) {
+    sockaddr_storage ss;
+    socklen_t slen = sizeof(ss);
+    int sd = ::accept(listen_sd, (sockaddr*)&ss, &slen);
     if (sd >= 0) {
-      errors = 0;
       ldout(msgr->cct, 10) << __func__ << " accepted incoming on sd " << sd << dendl;
 
       msgr->add_accept(sd);
@@ -248,10 +267,18 @@ void Processor::accept()
         continue;
       } else if (errno == EAGAIN) {
         break;
+      } else if (errno == EMFILE || errno == ENFILE) {
+        lderr(msgr->cct) << __func__ << " open file descriptions limit reached sd = " << sd
+                         << " errno " << errno << " " << cpp_strerror(errno) << dendl;
+        break;
+      } else if (errno == ECONNABORTED) {
+        ldout(msgr->cct, 0) << __func__ << " it was closed because of rst arrived sd = " << sd
+                            << " errno " << errno << " " << cpp_strerror(errno) << dendl;
+        continue;
       } else {
-        errors++;
-        ldout(msgr->cct, 20) << __func__ << " no incoming connection?  sd = " << sd
-                             << " errno " << errno << " " << cpp_strerror(errno) << dendl;
+        lderr(msgr->cct) << __func__ << " no incoming connection?  sd = " << sd
+                         << " errno " << errno << " " << cpp_strerror(errno) << dendl;
+        break;
       }
     }
   }
@@ -275,6 +302,46 @@ void Worker::stop()
   done = true;
   center.wakeup();
 }
+
+class WorkerPool {
+  CephContext *cct;
+  vector<Worker*> workers;
+  vector<int> coreids;
+  // Used to indicate whether thread started
+  bool started;
+  Mutex barrier_lock;
+  Cond barrier_cond;
+  atomic_t barrier_count;
+  simple_spinlock_t pool_spin = SIMPLE_SPINLOCK_INITIALIZER;
+
+  class C_barrier : public EventCallback {
+    WorkerPool *pool;
+    public:
+    explicit C_barrier(WorkerPool *p): pool(p) {}
+    void do_request(int id) {
+      Mutex::Locker l(pool->barrier_lock);
+      pool->barrier_count.dec();
+      pool->barrier_cond.Signal();
+      delete this;
+    }
+  };
+  friend class C_barrier;
+  public:
+  explicit WorkerPool(CephContext *c);
+  WorkerPool(const WorkerPool &) = delete;
+  WorkerPool& operator=(const WorkerPool &) = delete;
+  virtual ~WorkerPool();
+  void start();
+  Worker *get_worker();
+  int get_cpuid(int id) {
+    if (coreids.empty())
+      return -1;
+    return coreids[id % coreids.size()];
+  }
+  void barrier();
+  // uniq name for CephContext to distinguish differnt object
+  static const string name;
+};
 
 void *Worker::entry()
 {
@@ -307,11 +374,14 @@ void *Worker::entry()
  *******************/
 const string WorkerPool::name = "AsyncMessenger::WorkerPool";
 
-WorkerPool::WorkerPool(CephContext *c): cct(c), seq(0), started(false),
+WorkerPool::WorkerPool(CephContext *c): cct(c), started(false),
                                         barrier_lock("WorkerPool::WorkerPool::barrier_lock"),
                                         barrier_count(0)
 {
   assert(cct->_conf->ms_async_op_threads > 0);
+  // make sure user won't try to force some crazy number of worker threads
+  assert(cct->_conf->ms_async_max_op_threads >= cct->_conf->ms_async_op_threads && 
+         cct->_conf->ms_async_op_threads <= 32);
   for (int i = 0; i < cct->_conf->ms_async_op_threads; ++i) {
     Worker *w = new Worker(cct, this, i);
     workers.push_back(w);
@@ -351,12 +421,59 @@ void WorkerPool::start()
   }
 }
 
+Worker* WorkerPool::get_worker()
+{
+  ldout(cct, 10) << __func__ << dendl;
+
+   // start with some reasonably large number
+  unsigned min_load = std::numeric_limits<int>::max();
+  Worker* current_best = nullptr;
+
+  simple_spin_lock(&pool_spin);
+  // find worker with least references
+  // tempting case is returning on references == 0, but in reality
+  // this will happen so rarely that there's no need for special case.
+  for (auto p = workers.begin(); p != workers.end(); ++p) {
+    unsigned worker_load = (*p)->references.load();
+    ldout(cct, 20) << __func__ << " Worker " << *p << " load: " << worker_load << dendl;
+    if (worker_load < min_load) {
+      current_best = *p;
+      min_load = worker_load;
+    }
+  }
+
+  // if minimum load exceeds amount of workers, make a new worker
+  // logic behind this is that we're not going to create new worker
+  // just because others have *some* load, we'll defer worker creation
+  // until others have *plenty* of load. This will cause new worker
+  // to get assigned to all new connections *unless* one or more
+  // of workers get their load reduced - in that case, this worker
+  // will be assigned to new connection.
+  // TODO: add more logic and heuristics, so connections known to be
+  // of light workload (heartbeat service, etc.) won't overshadow
+  // heavy workload (clients, etc).
+  if (!current_best || ((workers.size() < (unsigned)cct->_conf->ms_async_max_op_threads)
+      && (min_load > workers.size()))) {
+     ldout(cct, 20) << __func__ << " creating worker" << dendl;
+     current_best = new Worker(cct, this, workers.size());
+     workers.push_back(current_best);
+     current_best->create("ms_async_worker");
+  } else {
+    ldout(cct, 20) << __func__ << " picked " << current_best 
+                   << " as best worker with load " << min_load << dendl;
+  }
+
+  ++current_best->references;
+  simple_spin_unlock(&pool_spin);
+
+  assert(current_best);
+  return current_best;
+}
+
 void WorkerPool::barrier()
 {
   ldout(cct, 10) << __func__ << " started." << dendl;
-  pthread_t cur = pthread_self();
   for (vector<Worker*>::iterator it = workers.begin(); it != workers.end(); ++it) {
-    assert(cur != (*it)->center.get_owner());
     barrier_count.inc();
     (*it)->center.dispatch_event_external(EventCallbackRef(new C_barrier(this)));
   }
@@ -377,6 +494,7 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
                                string mname, uint64_t _nonce, uint64_t features)
   : SimplePolicyMessenger(cct, name,mname, _nonce),
     processor(this, cct, _nonce),
+    dispatch_queue(cct, this, mname),
     lock("AsyncMessenger::lock"),
     nonce(_nonce), need_addr(true), did_bind(false),
     global_seq(0), deleted_lock("AsyncMessenger::deleted_lock"),
@@ -385,7 +503,7 @@ AsyncMessenger::AsyncMessenger(CephContext *cct, entity_name_t name,
   ceph_spin_init(&global_seq_lock);
   cct->lookup_or_create_singleton_object<WorkerPool>(pool, WorkerPool::name);
   local_worker = pool->get_worker();
-  local_connection = new AsyncConnection(cct, this, &local_worker->center, local_worker->get_perf_counter());
+  local_connection = new AsyncConnection(cct, this, &dispatch_queue, local_worker);
   local_features = features;
   init_local_connection();
   reap_handler = new C_handle_reap(this);
@@ -409,21 +527,24 @@ void AsyncMessenger::ready()
   Mutex::Locker l(lock);
   Worker *w = pool->get_worker();
   processor.start(w);
+  dispatch_queue.start();
 }
 
 int AsyncMessenger::shutdown()
 {
   ldout(cct,10) << __func__ << " " << get_myaddr() << dendl;
 
-  // break ref cycles on the loopback connection
-  processor.stop();
   mark_down_all();
+  // break ref cycles on the loopback connection
   local_connection->set_priv(NULL);
-  pool->barrier();
+   // done!  clean up.
+  processor.stop();
+  did_bind = false;
   lock.Lock();
   stop_cond.Signal();
-  lock.Unlock();
   stopped = true;
+  lock.Unlock();
+  pool->barrier();
   return 0;
 }
 
@@ -496,14 +617,16 @@ void AsyncMessenger::wait()
 
   lock.Unlock();
 
-  // done!  clean up.
-  ldout(cct,20) << __func__ << ": stopping processor thread" << dendl;
-  processor.stop();
-  did_bind = false;
-  ldout(cct,20) << __func__ << ": stopped processor thread" << dendl;
+  dispatch_queue.shutdown();
+  if (dispatch_queue.is_started()) {
+    ldout(cct, 10) << __func__ << ": waiting for dispatch queue" << dendl;
+    dispatch_queue.wait();
+    dispatch_queue.discard_local();
+    ldout(cct, 10) << __func__ << ": dispatch queue is stopped" << dendl;
+  }
 
   // close all connections
-  mark_down_all();
+  shutdown_connections(false);
 
   ldout(cct, 10) << __func__ << ": done." << dendl;
   ldout(cct, 1) << __func__ << " complete." << dendl;
@@ -514,7 +637,7 @@ AsyncConnectionRef AsyncMessenger::add_accept(int sd)
 {
   lock.Lock();
   Worker *w = pool->get_worker();
-  AsyncConnectionRef conn = new AsyncConnection(cct, this, &w->center, w->get_perf_counter());
+  AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w);
   conn->accept(sd);
   accepting_conns.insert(conn);
   lock.Unlock();
@@ -531,7 +654,7 @@ AsyncConnectionRef AsyncMessenger::create_connect(const entity_addr_t& addr, int
 
   // create connection
   Worker *w = pool->get_worker();
-  AsyncConnectionRef conn = new AsyncConnection(cct, this, &w->center, w->get_perf_counter());
+  AsyncConnectionRef conn = new AsyncConnection(cct, this, &dispatch_queue, w);
   conn->connect(addr, type);
   assert(!conns.count(addr));
   conns[addr] = conn;
@@ -633,7 +756,7 @@ void AsyncMessenger::set_addr_unknowns(entity_addr_t &addr)
   Mutex::Locker l(lock);
   if (my_inst.addr.is_blank_ip()) {
     int port = my_inst.addr.get_port();
-    my_inst.addr.addr = addr.addr;
+    my_inst.addr.u = addr.u;
     my_inst.addr.set_port(port);
     _init_local_connection();
   }
@@ -645,7 +768,7 @@ int AsyncMessenger::send_keepalive(Connection *con)
   return 0;
 }
 
-void AsyncMessenger::mark_down_all()
+void AsyncMessenger::shutdown_connections(bool queue_reset)
 {
   ldout(cct,1) << __func__ << " " << dendl;
   lock.Lock();
@@ -653,7 +776,7 @@ void AsyncMessenger::mark_down_all()
        q != accepting_conns.end(); ++q) {
     AsyncConnectionRef p = *q;
     ldout(cct, 5) << __func__ << " accepting_conn " << p.get() << dendl;
-    p->stop();
+    p->stop(queue_reset);
   }
   accepting_conns.clear();
 
@@ -663,7 +786,7 @@ void AsyncMessenger::mark_down_all()
     ldout(cct, 5) << __func__ << " mark down " << it->first << " " << p << dendl;
     conns.erase(it);
     p->get_perf_counter()->dec(l_msgr_active_connections);
-    p->stop();
+    p->stop(queue_reset);
   }
 
   {
@@ -684,11 +807,17 @@ void AsyncMessenger::mark_down(const entity_addr_t& addr)
   AsyncConnectionRef p = _lookup_conn(addr);
   if (p) {
     ldout(cct, 1) << __func__ << " " << addr << " -- " << p << dendl;
-    p->stop();
+    p->stop(true);
   } else {
     ldout(cct, 1) << __func__ << " " << addr << " -- connection dne" << dendl;
   }
   lock.Unlock();
+}
+
+Connection *AsyncMessenger::create_anon_connection() {
+  Mutex::Locker l(lock);
+  Worker *w = pool->get_worker();
+  return new AsyncConnection(cct, this, &dispatch_queue, w);
 }
 
 int AsyncMessenger::get_proto_version(int peer_type, bool connect)
@@ -701,18 +830,10 @@ int AsyncMessenger::get_proto_version(int peer_type, bool connect)
     return cluster_protocol;
   } else {
     // public
-    if (connect) {
-      switch (peer_type) {
-        case CEPH_ENTITY_TYPE_OSD: return CEPH_OSDC_PROTOCOL;
-        case CEPH_ENTITY_TYPE_MDS: return CEPH_MDSC_PROTOCOL;
-        case CEPH_ENTITY_TYPE_MON: return CEPH_MONC_PROTOCOL;
-      }
-    } else {
-      switch (my_type) {
-        case CEPH_ENTITY_TYPE_OSD: return CEPH_OSDC_PROTOCOL;
-        case CEPH_ENTITY_TYPE_MDS: return CEPH_MDSC_PROTOCOL;
-        case CEPH_ENTITY_TYPE_MON: return CEPH_MONC_PROTOCOL;
-      }
+    switch (connect ? peer_type : my_type) {
+      case CEPH_ENTITY_TYPE_OSD: return CEPH_OSDC_PROTOCOL;
+      case CEPH_ENTITY_TYPE_MDS: return CEPH_MDSC_PROTOCOL;
+      case CEPH_ENTITY_TYPE_MON: return CEPH_MONC_PROTOCOL;
     }
   }
   return 0;
@@ -733,7 +854,7 @@ void AsyncMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
     need_addr = false;
     entity_addr_t t = peer_addr_for_me;
     t.set_port(my_inst.addr.get_port());
-    my_inst.addr.addr = t.addr;
+    my_inst.addr.u = t.u;
     ldout(cct, 1) << __func__ << " learned my addr " << my_inst.addr << dendl;
     _init_local_connection();
   }

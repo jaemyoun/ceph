@@ -25,12 +25,8 @@ StupidAllocator::~StupidAllocator()
 
 unsigned StupidAllocator::_choose_bin(uint64_t orig_len)
 {
-  uint64_t len = orig_len / g_conf->bluestore_min_alloc_size;
-  int bin = 0;
-  while (len && bin + 1 < (int)free.size()) {
-    len >>= 1;
-    bin++;
-  }
+  uint64_t len = orig_len / g_conf->bdev_block_size;
+  int bin = std::min((int)cbits(len), (int)free.size() - 1);
   dout(30) << __func__ << " len " << orig_len << " -> " << bin << dendl;
   return bin;
 }
@@ -85,15 +81,15 @@ static uint64_t aligned_len(btree_interval_set<uint64_t>::iterator p,
 }
 
 int StupidAllocator::allocate(
-  uint64_t need_size, uint64_t alloc_unit, int64_t hint,
+  uint64_t want_size, uint64_t alloc_unit, int64_t hint,
   uint64_t *offset, uint32_t *length)
 {
   std::lock_guard<std::mutex> l(lock);
-  dout(10) << __func__ << " need_size " << need_size
+  dout(10) << __func__ << " want_size " << want_size
 	   << " alloc_unit " << alloc_unit
 	   << " hint " << hint
 	   << dendl;
-  uint64_t want = MAX(alloc_unit, need_size);
+  uint64_t want = MAX(alloc_unit, want_size);
   int bin = _choose_bin(want);
   int orig_bin = bin;
 
@@ -107,7 +103,7 @@ int StupidAllocator::allocate(
     for (bin = orig_bin; bin < (int)free.size(); ++bin) {
       p = free[bin].lower_bound(hint);
       while (p != free[bin].end()) {
-	if (aligned_len(p, alloc_unit) >= need_size) {
+	if (aligned_len(p, alloc_unit) >= want_size) {
 	  goto found;
 	}
 	++p;
@@ -115,11 +111,12 @@ int StupidAllocator::allocate(
     }
   }
 
-  // search up (from origin)
+  // search up (from origin, and skip searched extents by hint)
   for (bin = orig_bin; bin < (int)free.size(); ++bin) {
     p = free[bin].begin();
-    while (p != free[bin].end()) {
-      if (aligned_len(p, alloc_unit) >= need_size) {
+    auto end = hint ? free[bin].lower_bound(hint) : free[bin].end();
+    while (p != end) {
+      if (aligned_len(p, alloc_unit) >= want_size) {
 	goto found;
       }
       ++p;
@@ -139,10 +136,11 @@ int StupidAllocator::allocate(
     }
   }
 
-  // search down (origin)
+  // search down (from origin, and skip searched extents by hint)
   for (bin = orig_bin; bin >= 0; --bin) {
     p = free[bin].begin();
-    while (p != free[bin].end()) {
+    auto end = hint ? free[bin].lower_bound(hint) : free[bin].end();
+    while (p != end) {
       if (aligned_len(p, alloc_unit) >= alloc_unit) {
 	goto found;
       }
@@ -158,7 +156,7 @@ int StupidAllocator::allocate(
   if (skew)
     skew = alloc_unit - skew;
   *offset = p.get_start() + skew;
-  *length = MIN(MAX(alloc_unit, need_size), p.get_len() - skew);
+  *length = MIN(MAX(alloc_unit, want_size), p.get_len() - skew);
   if (g_conf->bluestore_debug_small_allocations) {
     uint64_t max =
       alloc_unit * (rand() % g_conf->bluestore_debug_small_allocations);

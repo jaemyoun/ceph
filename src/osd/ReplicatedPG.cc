@@ -28,40 +28,21 @@
 #include "common/perf_counters.h"
 
 #include "messages/MOSDOp.h"
-#include "messages/MOSDOpReply.h"
 #include "messages/MOSDSubOp.h"
 #include "messages/MOSDSubOpReply.h"
-#include "messages/MOSDRepOp.h"
-#include "messages/MOSDRepOpReply.h"
-
-#include "messages/MOSDPGNotify.h"
-#include "messages/MOSDPGInfo.h"
-#include "messages/MOSDPGRemove.h"
 #include "messages/MOSDPGTrim.h"
 #include "messages/MOSDPGScan.h"
+#include "messages/MOSDRepScrub.h"
 #include "messages/MOSDPGBackfill.h"
-
-#include "messages/MOSDPing.h"
-#include "messages/MWatchNotify.h"
-
-#include "messages/MOSDPGPush.h"
-#include "messages/MOSDPGPull.h"
-#include "messages/MOSDPGPushReply.h"
 #include "messages/MOSDPGUpdateLogMissing.h"
 #include "messages/MOSDPGUpdateLogMissingReply.h"
 #include "messages/MCommandReply.h"
-
-#include "Watch.h"
-
 #include "mds/inode_backtrace.h" // Ugh
 
 #include "common/config.h"
 #include "include/compat.h"
-#include "common/cmdparse.h"
-
 #include "mon/MonClient.h"
 #include "osdc/Objecter.h"
-
 #include "json_spirit/json_spirit_value.h"
 #include "json_spirit/json_spirit_reader.h"
 #include "include/assert.h"  // json_spirit clobbers it
@@ -217,7 +198,7 @@ void ReplicatedPG::on_local_recover(
       recovery_info.oi.prior_version = recovery_info.oi.version;
       recovery_info.oi.version = latest->version;
       bufferlist bl;
-      ::encode(recovery_info.oi, bl);
+      ::encode(recovery_info.oi, bl, get_osdmap()->get_up_osd_features());
       assert(!pool.info.require_rollback());
       t->setattr(coll, ghobject_t(recovery_info.soid), OI_ATTR, bl);
       if (obc)
@@ -391,7 +372,6 @@ void ReplicatedPG::maybe_kick_recovery(
   } else {
     dout(7) << "object " << soid << " v " << v << ", recovering." << dendl;
     PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
-    h->cache_dont_need = false;
     if (is_missing_object(soid)) {
       recover_missing(soid, v, cct->_conf->osd_client_op_priority, h);
     } else {
@@ -420,7 +400,7 @@ void ReplicatedPG::wait_for_all_missing(OpRequestRef op)
 bool ReplicatedPG::is_degraded_or_backfilling_object(const hobject_t& soid)
 {
   /* The conditions below may clear (on_local_recover, before we queue
-   * the tranasction) before we actually requeue the degraded waiters
+   * the transaction) before we actually requeue the degraded waiters
    * in on_global_recover after the transaction completes.
    */
   if (waiting_for_degraded_object.count(soid))
@@ -465,6 +445,7 @@ void ReplicatedPG::block_write_on_full_cache(
 	   << " on full cache" << dendl;
   objects_blocked_on_cache_full.insert(oid);
   waiting_for_cache_not_full.push_back(op);
+  op->mark_delayed("waiting for cache not full");
 }
 
 void ReplicatedPG::block_write_on_snap_rollback(
@@ -577,7 +558,7 @@ bool PGLSParentFilter::filter(const hobject_t &obj,
   vector<inode_backpointer_t>::iterator vi;
   for (vi = bt.ancestors.begin(); vi != bt.ancestors.end(); ++vi) {
     generic_dout(0) << "vi->dirino=" << vi->dirino << " parent_ino=" << parent_ino << dendl;
-    if ( vi->dirino == parent_ino) {
+    if (vi->dirino == parent_ino) {
       ::encode(*vi, outdata);
       return true;
     }
@@ -679,7 +660,7 @@ int ReplicatedPG::get_pgls_filter(bufferlist::iterator& iter, PGLSFilter **pfilt
   } else {
     // Successfully constructed and initialized, return it.
     *pfilter = filter;
-    return  0;
+    return 0;
   }
 }
 
@@ -829,7 +810,6 @@ int ReplicatedPG::do_command(
     {
       f->open_array_section("objects");
       int32_t num = 0;
-      bufferlist bl;
       for (; p != needs_recovery_map.end() && num < cct->_conf->osd_command_max_records; ++p) {
         if (missing_loc.is_unfound(p->first)) {
 	  f->open_object_section("object");
@@ -854,7 +834,7 @@ int ReplicatedPG::do_command(
       }
       f->close_section();
     }
-    f->dump_int("more", p != needs_recovery_map.end());
+    f->dump_bool("more", p != needs_recovery_map.end());
     f->close_section();
     f->flush(odata);
     return 0;
@@ -925,8 +905,10 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
       // fall through
 
     case CEPH_OSD_OP_PGNLS:
-      if (m->get_pg() != info.pgid.pgid) {
-        dout(10) << " pgnls pg=" << m->get_pg() << " != " << info.pgid << dendl;
+      if (get_osdmap()->raw_pg_to_pg(m->get_pg()) != info.pgid.pgid) {
+        dout(10) << " pgnls pg=" << m->get_pg()
+		 << " " << get_osdmap()->raw_pg_to_pg(m->get_pg())
+		 << " != " << info.pgid << dendl;
 	result = 0; // hmm?
       } else {
 	unsigned list_size = MIN(cct->_conf->osd_max_pgls, p->op.pgls.count);
@@ -946,7 +928,21 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 
 	hobject_t next;
 	hobject_t lower_bound = response.handle;
-        dout(10) << " pgnls lower_bound " << lower_bound << dendl;
+	hobject_t pg_start = info.pgid.pgid.get_hobj_start();
+	hobject_t pg_end = info.pgid.pgid.get_hobj_end(pool.info.get_pg_num());
+        dout(10) << " pgnls lower_bound " << lower_bound
+		 << " pg_end " << pg_end << dendl;
+	if (get_sort_bitwise() &&
+	    ((!lower_bound.is_max() &&
+	      cmp_bitwise(lower_bound, pg_end) >= 0) ||
+	     (lower_bound != hobject_t() &&
+	      cmp_bitwise(lower_bound, pg_start) < 0))) {
+	  // this should only happen with a buggy client.
+	  dout(10) << "outside of PG bounds " << pg_start << " .. "
+		   << pg_end << dendl;
+	  result = -EINVAL;
+	  break;
+	}
 
 	hobject_t current = lower_bound;
 	osr->flush();
@@ -1081,7 +1077,7 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	} else {
           response.handle = next;
         }
-        dout(10) << "pgls handle=" << response.handle << dendl;
+        dout(10) << "pgnls handle=" << response.handle << dendl;
 	::encode(response, osd_op.outdata);
 	if (filter)
 	  ::encode(filter_out, osd_op.outdata);
@@ -1113,8 +1109,10 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
       // fall through
 
     case CEPH_OSD_OP_PGLS:
-      if (m->get_pg() != info.pgid.pgid) {
-        dout(10) << " pgls pg=" << m->get_pg() << " != " << info.pgid << dendl;
+      if (get_osdmap()->raw_pg_to_pg(m->get_pg()) != info.pgid.pgid) {
+        dout(10) << " pgls pg=" << m->get_pg()
+		 << " " << get_osdmap()->raw_pg_to_pg(m->get_pg())
+		 << " != " << info.pgid << dendl;
 	result = 0; // hmm?
       } else {
 	unsigned list_size = MIN(cct->_conf->osd_max_pgls, p->op.pgls.count);
@@ -1292,6 +1290,7 @@ void ReplicatedPG::do_pg_op(OpRequestRef op)
 	  }
 	  if (is_unreadable_object(oid)) {
 	    wait_for_unreadable_object(oid, op);
+            delete filter;
 	    return;
 	  }
 	  result = osd->store->read(ch, ghobject_t(oid), 0, 0, osd_op.outdata);
@@ -1402,7 +1401,7 @@ ReplicatedPG::ReplicatedPG(OSDService *o, OSDMapRef curmap,
     PGBackend::build_pg_backend(
       _pool.info, curmap, this, coll_t(p), ch, o->store, cct)),
   object_contexts(o->cct, g_conf->osd_pg_object_context_cache_count),
-  snapset_contexts_lock("ReplicatedPG::snapset_contexts"),
+  snapset_contexts_lock("ReplicatedPG::snapset_contexts_lock"),
   backfills_in_flight(hobject_t::Comparator(true)),
   pending_backfill_updates(hobject_t::Comparator(true)),
   new_backfill(false),
@@ -1571,6 +1570,12 @@ void ReplicatedPG::do_op(OpRequestRef& op)
   m->finish_decode();
   m->clear_payload();
 
+  if (m->has_flag(CEPH_OSD_FLAG_PARALLELEXEC)) {
+    // not implemented.
+    osd->reply_op_error(op, -EINVAL);
+    return;
+  }
+
   if (op->rmw_flags == 0) {
     int r = osd->osd->init_op_flags(op);
     if (r) {
@@ -1609,13 +1614,38 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     return;
   }
 
+  hobject_t head(m->get_oid(), m->get_object_locator().key,
+		 CEPH_NOSNAP, m->get_pg().ps(),
+		 info.pgid.pool(), m->get_object_locator().nspace);
+
   // object name too long?
-  unsigned max_name_len = MIN(g_conf->osd_max_object_name_len,
-                              osd->osd->store->get_max_object_name_length());
-  if (m->get_oid().name.size() > max_name_len) {
-    dout(4) << "do_op '" << m->get_oid().name << "' is longer than "
-            << max_name_len << " bytes" << dendl;
+  if (m->get_oid().name.size() > g_conf->osd_max_object_name_len) {
+    dout(4) << "do_op name is longer than "
+            << g_conf->osd_max_object_name_len
+	    << " bytes" << dendl;
     osd->reply_op_error(op, -ENAMETOOLONG);
+    return;
+  }
+  if (m->get_object_locator().key.size() > g_conf->osd_max_object_name_len) {
+    dout(4) << "do_op locator is longer than "
+            << g_conf->osd_max_object_name_len
+	    << " bytes" << dendl;
+    osd->reply_op_error(op, -ENAMETOOLONG);
+    return;
+  }
+  if (m->get_object_locator().nspace.size() >
+      g_conf->osd_max_object_namespace_len) {
+    dout(4) << "do_op namespace is longer than "
+            << g_conf->osd_max_object_namespace_len
+	    << " bytes" << dendl;
+    osd->reply_op_error(op, -ENAMETOOLONG);
+    return;
+  }
+
+  if (int r = osd->store->validate_hobject_key(head)) {
+    dout(4) << "do_op object " << head << " invalid for backing store: "
+	    << r << dendl;
+    osd->reply_op_error(op, r);
     return;
   }
 
@@ -1626,20 +1656,27 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     return;
   }
 
+  // order this op as a write?
+  bool write_ordered =
+    op->may_write() ||
+    op->may_cache() ||
+    m->has_flag(CEPH_OSD_FLAG_RWORDERED);
+
   // discard due to cluster full transition?  (we discard any op that
   // originates before the cluster or pool is marked full; the client
   // will resend after the full flag is removed or if they expect the
   // op to succeed despite being full).  The except is FULL_FORCE ops,
   // which there is no reason to discard because they bypass all full
   // checks anyway.
+  // If this op isn't write or read-ordered, we skip
   // FIXME: we exclude mds writes for now.
-  if (!(m->get_source().is_mds() || m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) &&
+  if (write_ordered && !( m->get_source().is_mds() || m->has_flag(CEPH_OSD_FLAG_FULL_FORCE)) &&
       info.history.last_epoch_marked_full > m->get_map_epoch()) {
     dout(10) << __func__ << " discarding op sent before full " << m << " "
 	     << *m << dendl;
     return;
   }
-  if (!m->get_source().is_mds() && osd->check_failsafe_full()) {
+  if (!(m->get_source().is_mds()) && osd->check_failsafe_full() && write_ordered) {
     dout(10) << __func__ << " fail-safe full check failed, dropping request"
 	     << dendl;
     return;
@@ -1670,12 +1707,6 @@ void ReplicatedPG::do_op(OpRequestRef& op)
     }
   }
 
-  // order this op as a write?
-  bool write_ordered =
-    op->may_write() ||
-    op->may_cache() ||
-    m->has_flag(CEPH_OSD_FLAG_RWORDERED);
-
   dout(10) << "do_op " << *m
 	   << (op->may_write() ? " may_write" : "")
 	   << (op->may_read() ? " may_read" : "")
@@ -1683,11 +1714,6 @@ void ReplicatedPG::do_op(OpRequestRef& op)
 	   << " -> " << (write_ordered ? "write-ordered" : "read-ordered")
 	   << " flags " << ceph_osd_flag_string(m->get_flags())
 	   << dendl;
-
-  hobject_t head(m->get_oid(), m->get_object_locator().key,
-		 CEPH_NOSNAP, m->get_pg().ps(),
-		 info.pgid.pool(), m->get_object_locator().nspace);
-
 
   if (write_ordered &&
       scrubber.write_blocked_by_scrub(head, get_sort_bitwise())) {
@@ -2058,8 +2084,7 @@ void ReplicatedPG::do_op(OpRequestRef& op)
 
   if (r) {
     dout(20) << __func__ << " returned an error: " << r << dendl;
-    close_op_ctx(ctx);
-    osd->reply_op_error(op, r);
+    reply_ctx(ctx, r);
     return;
   }
 
@@ -2176,8 +2201,6 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
   }
 
   // older versions do not proxy the feature bits.
-  bool can_proxy_read = get_osdmap()->get_up_osd_features() &
-    CEPH_FEATURE_OSD_PROXY_FEATURES;
   bool can_proxy_write = get_osdmap()->get_up_osd_features() &
     CEPH_FEATURE_OSD_PROXY_WRITE_FEATURES;
   OpRequestRef promote_op;
@@ -2188,16 +2211,9 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
 	agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
       if (!op->may_write() && !op->may_cache() &&
 	  !write_ordered && !must_promote) {
-	if (can_proxy_read) {
-	  dout(20) << __func__ << " cache pool full, proxying read" << dendl;
-	  do_proxy_read(op);
-	  return cache_result_t::HANDLED_PROXY;
-	} else {
-	  dout(20) << __func__ << " cache pool full, redirect read" << dendl;
-	  do_cache_redirect(op);
-	  return cache_result_t::HANDLED_REDIRECT;
-	}
-	assert(0 == "unreachable");
+	dout(20) << __func__ << " cache pool full, proxying read" << dendl;
+	do_proxy_read(op);
+	return cache_result_t::HANDLED_PROXY;
       }
       dout(20) << __func__ << " cache pool full, waiting" << dendl;
       block_write_on_full_cache(missing_oid, op);
@@ -2228,46 +2244,29 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
       }
       return cache_result_t::HANDLED_PROXY;
     } else {
-      bool did_proxy_read = false;
-      if (can_proxy_read) {
-        do_proxy_read(op);
-	did_proxy_read = true;
-      } else {
-        promote_op = op;   // for non-proxy case promote_object needs this
-      }
+      do_proxy_read(op);
 
       // Avoid duplicate promotion
       if (obc.get() && obc->is_blocked()) {
-	if (!did_proxy_read) {
-	  wait_for_blocked_object(obc->obs.oi.soid, op);
-	}
 	if (promote_obc)
 	  *promote_obc = obc;
         return cache_result_t::BLOCKED_PROMOTE;
       }
 
       // Promote too?
-      bool promoted = false;
       if (!op->need_skip_promote()) {
-        promoted = maybe_promote(obc, missing_oid, oloc, in_hit_set,
-                                 pool.info.min_read_recency_for_promote,
-                                 promote_op, promote_obc);
+        (void)maybe_promote(obc, missing_oid, oloc, in_hit_set,
+                            pool.info.min_read_recency_for_promote,
+                            promote_op, promote_obc);
       }
-      if (!promoted && !did_proxy_read) {
-	// redirect the op if it's not proxied and not promoting
-	do_cache_redirect(op);
-	return cache_result_t::HANDLED_REDIRECT;
-      } else if (did_proxy_read) {
-	return cache_result_t::HANDLED_PROXY;
-      } else {
-	assert(promoted);
-	return cache_result_t::BLOCKED_PROMOTE;
-      }
+
+      return cache_result_t::HANDLED_PROXY;
     }
     assert(0 == "unreachable");
     return cache_result_t::NOOP;
 
   case pg_pool_t::CACHEMODE_FORWARD:
+    // FIXME: this mode allows requests to be reordered.
     do_cache_redirect(op);
     return cache_result_t::HANDLED_REDIRECT;
 
@@ -2301,6 +2300,28 @@ ReplicatedPG::cache_result_t ReplicatedPG::maybe_handle_cache_detail(
     // If it is a read, we can read, we need to forward it
     do_cache_redirect(op);
     return cache_result_t::HANDLED_REDIRECT;
+
+  case pg_pool_t::CACHEMODE_PROXY:
+    if (!must_promote) {
+      if (op->may_write() || op->may_cache() || write_ordered) {
+	if (can_proxy_write) {
+	  do_proxy_write(op, missing_oid);
+	  return cache_result_t::HANDLED_PROXY;
+	}
+      } else {
+	do_proxy_read(op);
+	return cache_result_t::HANDLED_PROXY;
+      }
+    }
+    // ugh, we're forced to promote.
+    if (agent_state &&
+	agent_state->evict_mode == TierAgentState::EVICT_MODE_FULL) {
+      dout(20) << __func__ << " cache pool full, waiting" << dendl;
+      block_write_on_full_cache(missing_oid, op);
+      return cache_result_t::BLOCKED_FULL;
+    }
+    promote_object(obc, missing_oid, oloc, op, promote_obc);
+    return cache_result_t::BLOCKED_PROMOTE;
 
   case pg_pool_t::CACHEMODE_READPROXY:
     // Do writeback to the cache tier for writes
@@ -2773,6 +2794,7 @@ void ReplicatedPG::promote_object(ObjectContextRef obc,
 	     << " blocked by scrub" << dendl;
     if (op) {
       waiting_for_active.push_back(op);
+      op->mark_delayed("waiting for scrub");
       dout(10) << __func__ << " " << hoid
 	       << " placing op in waiting_for_active" << dendl;
     } else {
@@ -2939,7 +2961,7 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
   // read or error?
   if (ctx->op_t->empty() || result < 0) {
     // finish side-effects
-    if (result == 0)
+    if (result >= 0)
       do_osd_op_effects(ctx, m->get_connection());
 
     if (ctx->pending_async_reads.empty()) {
@@ -3011,8 +3033,6 @@ void ReplicatedPG::execute_ctx(OpContext *ctx)
       if (ctx->op)
 	log_op_stats(
 	  ctx);
-
-      publish_stats_to_osd();
 
       if (m && m->wants_ondisk() && !ctx->sent_disk) {
 	// send commit.
@@ -3131,15 +3151,15 @@ void ReplicatedPG::do_sub_op(OpRequestRef op)
   assert(m->get_type() == MSG_OSD_SUBOP);
   dout(15) << "do_sub_op " << *op->get_req() << dendl;
 
-  OSDOp *first = NULL;
-  if (m->ops.size() >= 1) {
-    first = &m->ops[0];
-  }
-
   if (!is_peered()) {
     waiting_for_peered.push_back(op);
     op->mark_delayed("waiting for active");
     return;
+  }
+
+  OSDOp *first = NULL;
+  if (m->ops.size() >= 1) {
+    first = &m->ops[0];
   }
 
   if (first) {
@@ -3152,9 +3172,6 @@ void ReplicatedPG::do_sub_op(OpRequestRef op)
       return;
     case CEPH_OSD_OP_SCRUB_UNRESERVE:
       sub_op_scrub_unreserve(op);
-      return;
-    case CEPH_OSD_OP_SCRUB_STOP:
-      sub_op_scrub_stop(op);
       return;
     case CEPH_OSD_OP_SCRUB_MAP:
       sub_op_scrub_map(op);
@@ -3316,7 +3333,7 @@ ReplicatedPG::OpContextUPtr ReplicatedPG::trim_object(const hobject_t &coid)
   bufferlist bl;
   ObjectContextRef obc = get_object_context(coid, false, NULL);
   if (!obc) {
-    derr << __func__ << "could not find coid " << coid << dendl;
+    derr << __func__ << " could not find coid " << coid << dendl;
     assert(0);
   }
   assert(obc->ssc);
@@ -3326,6 +3343,7 @@ ReplicatedPG::OpContextUPtr ReplicatedPG::trim_object(const hobject_t &coid)
     obc->ssc->snapset.head_exists ? CEPH_NOSNAP:CEPH_SNAPDIR, coid.get_hash(),
     info.pgid.pool(), coid.get_namespace());
   ObjectContextRef snapset_obc = get_object_context(snapoid, false);
+  assert(snapset_obc);
 
   object_info_t &coi = obc->obs.oi;
   set<snapid_t> old_snaps(coi.snaps.begin(), coi.snaps.end());
@@ -3463,7 +3481,7 @@ ReplicatedPG::OpContextUPtr ReplicatedPG::trim_object(const hobject_t &coid)
     coi.prior_version = coi.version;
     coi.version = ctx->at_version;
     bl.clear();
-    ::encode(coi, bl);
+    ::encode(coi, bl, get_osdmap()->get_up_osd_features());
     setattr_maybe_cache(ctx->obc, ctx.get(), t, OI_ATTR, bl);
 
     ctx->log.push_back(
@@ -3546,7 +3564,7 @@ ReplicatedPG::OpContextUPtr ReplicatedPG::trim_object(const hobject_t &coid)
     attrs[SS_ATTR].claim(bl);
 
     bl.clear();
-    ::encode(ctx->snapset_obc->obs.oi, bl);
+    ::encode(ctx->snapset_obc->obs.oi, bl, get_osdmap()->get_up_osd_features());
     attrs[OI_ATTR].claim(bl);
     setattrs_maybe_cache(ctx->snapset_obc, ctx.get(), t, attrs);
 
@@ -3653,6 +3671,40 @@ int ReplicatedPG::do_xattr_cmp_str(int op, string& v1s, bufferlist& xattr)
   default:
     return -EINVAL;
   }
+}
+
+int ReplicatedPG::do_writesame(OpContext *ctx, OSDOp& osd_op)
+{
+  ceph_osd_op& op = osd_op.op;
+  vector<OSDOp> write_ops(1);
+  OSDOp& write_op = write_ops[0];
+  uint64_t write_length = op.writesame.length;
+  int result = 0;
+
+  if (!write_length)
+    return 0;
+
+  if (!op.writesame.data_length || write_length % op.writesame.data_length)
+    return -EINVAL;
+
+  if (op.writesame.data_length != osd_op.indata.length()) {
+    derr << "invalid length ws data length " << op.writesame.data_length << " actual len " << osd_op.indata.length() << dendl;
+    return -EINVAL;
+  }
+
+  while (write_length) {
+    write_op.indata.append(osd_op.indata.c_str(), op.writesame.data_length);
+    write_length -= op.writesame.data_length;
+  }
+
+  write_op.op.op = CEPH_OSD_OP_WRITE;
+  write_op.op.extent.offset = op.writesame.offset;
+  write_op.op.extent.length = op.writesame.length;
+  result = do_osd_ops(ctx, write_ops);
+  if (result < 0)
+    derr << "do_writesame do_osd_ops failed " << result << dendl;
+
+  return result;
 }
 
 // ========================================================================
@@ -3763,7 +3815,7 @@ int ReplicatedPG::do_tmapup(OpContext *ctx, bufferlist::iterator& bp, OSDOp& osd
     newop.op.op = CEPH_OSD_OP_READ;
     newop.op.extent.offset = 0;
     newop.op.extent.length = 0;
-    do_osd_ops(ctx, nops);
+    result = do_osd_ops(ctx, nops);
 
     dout(10) << "tmapup read " << newop.outdata.length() << dendl;
 
@@ -3807,7 +3859,6 @@ int ReplicatedPG::do_tmapup(OpContext *ctx, bufferlist::iterator& bp, OSDOp& osd
       ::decode(nextkey, ip);
       ::decode(nextval, ip);
     }
-    result = 0;
     while (!bp.end() && !result) {
       __u8 op;
       string key;
@@ -3988,14 +4039,15 @@ struct FillInVerifyExtent : public Context {
 
 struct ToSparseReadResult : public Context {
   bufferlist& data_bl;
+  uint64_t data_offset;
   ceph_le64& len;
-  ToSparseReadResult(bufferlist& bl, ceph_le64& len):
-    data_bl(bl), len(len) {}
+  ToSparseReadResult(bufferlist& bl, uint64_t offset, ceph_le64& len):
+    data_bl(bl), data_offset(offset),len(len) {}
   void finish(int r) {
     if (r < 0) return;
     len = r;
     bufferlist outdata;
-    map<uint64_t, uint64_t> extents = {{0, r}};
+    map<uint64_t, uint64_t> extents = {{data_offset, r}};
     ::encode(extents, outdata);
     ::encode_destructively(data_bl, outdata);
     data_bl.swap(outdata);
@@ -4259,7 +4311,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	ctx->pending_async_reads.push_back(
 	  make_pair(
 	    boost::make_tuple(op.extent.offset, op.extent.length, op.flags),
-	    make_pair(&osd_op.outdata, new ToSparseReadResult(osd_op.outdata,
+	    make_pair(&osd_op.outdata, new ToSparseReadResult(osd_op.outdata, op.extent.offset,
 							      op.extent.length))));
 	dout(10) << " async_read (was sparse_read) noted for " << soid << dendl;
       } else {
@@ -4716,7 +4768,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
           resp.entries.push_back(wi);
         }
 
-        resp.encode(osd_op.outdata);
+        resp.encode(osd_op.outdata, ctx->get_features());
         result = 0;
 
         ctx->delta_stats.num_rd++;
@@ -4879,16 +4931,13 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
       ++ctx->num_write;
       {
 	tracepoint(osd, do_osd_op_pre_setallochint, soid.oid.name.c_str(), soid.snap.val, op.alloc_hint.expected_object_size, op.alloc_hint.expected_write_size);
-        if (!(get_min_upacting_features() & CEPH_FEATURE_OSD_SET_ALLOC_HINT)) { 
-          result = -EOPNOTSUPP;
-          break;
-        }
 	if (maybe_create_new_object(ctx)) {
           ctx->mod_desc.create();
           t->touch(soid);
 	}
         t->set_alloc_hint(soid, op.alloc_hint.expected_object_size,
-                          op.alloc_hint.expected_write_size);
+                          op.alloc_hint.expected_write_size,
+			  op.alloc_hint.flags);
         ctx->delta_stats.num_wr++;
         result = 0;
       }
@@ -5041,6 +5090,12 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	write_update_size_and_usage(ctx->delta_stats, oi, ctx->modified_ranges,
 	    0, op.extent.length, true, op.extent.length != oi.size ? true : false);
       }
+      break;
+
+    case CEPH_OSD_OP_WRITESAME:
+      ++ctx->num_write;
+      tracepoint(osd, do_osd_op_pre_writesame, soid.oid.name.c_str(), soid.snap.val, oi.size, op.writesame.offset, op.writesame.length, op.writesame.data_length);
+      result = do_writesame(ctx, osd_op);
       break;
 
     case CEPH_OSD_OP_ROLLBACK :
@@ -5535,7 +5590,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	tracepoint(osd, do_osd_op_pre_omapgetkeys, soid.oid.name.c_str(), soid.snap.val, start_after.c_str(), max_return);
 	set<string> out_set;
 
-	if (pool.info.supports_omap()) {
+	if (oi.is_omap()) {
 	  ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(
 	    coll, ghobject_t(soid)
 	    );
@@ -5572,7 +5627,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	tracepoint(osd, do_osd_op_pre_omapgetvals, soid.oid.name.c_str(), soid.snap.val, start_after.c_str(), max_return, filter_prefix.c_str());
 	map<string, bufferlist> out_set;
 
-	if (pool.info.supports_omap()) {
+	if (oi.is_omap()) {
 	  ObjectMap::ObjectMapIterator iter = osd->store->get_omap_iterator(
 	    coll, ghobject_t(soid)
 	    );
@@ -5598,7 +5653,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 
     case CEPH_OSD_OP_OMAPGETHEADER:
       tracepoint(osd, do_osd_op_pre_omapgetheader, soid.oid.name.c_str(), soid.snap.val);
-      if (!pool.info.supports_omap()) {
+      if (!oi.is_omap()) {
 	// return empty header
 	break;
       }
@@ -5624,7 +5679,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	}
 	tracepoint(osd, do_osd_op_pre_omapgetvalsbykeys, soid.oid.name.c_str(), soid.snap.val, list_entries(keys_to_get).c_str());
 	map<string, bufferlist> out;
-	if (pool.info.supports_omap()) {
+	if (oi.is_omap()) {
 	  osd->store->omap_get_values(ch, ghobject_t(soid), keys_to_get, &out);
 	} // else return empty omap entries
 	::encode(out, osd_op.outdata);
@@ -5654,7 +5709,7 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	
 	map<string, bufferlist> out;
 
-	if (pool.info.supports_omap()) {
+	if (oi.is_omap()) {
 	  set<string> to_get;
 	  for (map<string, pair<bufferlist, int> >::iterator i = assertions.begin();
 	       i != assertions.end();
@@ -5780,10 +5835,13 @@ int ReplicatedPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	  result = -ENOENT;
 	  break;
 	}
-	t->omap_clear(soid);
-	ctx->delta_stats.num_wr++;
+	if (oi.is_omap()) {
+	  t->omap_clear(soid);
+	  ctx->delta_stats.num_wr++;
+	  obs.oi.clear_omap_digest();
+	  obs.oi.clear_flag(object_info_t::FLAG_OMAP);
+	}
       }
-      obs.oi.clear_omap_digest();
       break;
 
     case CEPH_OSD_OP_OMAPRMKEYS:
@@ -6034,6 +6092,9 @@ inline int ReplicatedPG::_delete_oid(OpContext *ctx, bool no_whiteout)
     dout(20) << __func__ << " deleting whiteout on " << soid << dendl;
     ctx->delta_stats.num_whiteouts--;
   }
+  if (oi.is_cache_pinned()) {
+    ctx->delta_stats.num_objects_pinned--;
+  }
   if (soid.is_head())
     snapset.head_exists = false;
   obs.exists = false;
@@ -6174,6 +6235,15 @@ int ReplicatedPG::_rollback_to(OpContext *ctx, ceph_osd_op& op)
 	obs.oi.set_omap_digest(rollback_to->obs.oi.omap_digest);
       else
 	obs.oi.clear_omap_digest();
+
+      if (rollback_to->obs.oi.is_omap()) {
+	dout(10) << __func__ << " setting omap flag on " << obs.oi.soid << dendl;
+	obs.oi.set_flag(object_info_t::FLAG_OMAP);
+      } else {
+	dout(10) << __func__ << " clearing omap flag on " << obs.oi.soid << dendl;
+	obs.oi.clear_flag(object_info_t::FLAG_OMAP);
+      }
+
       snapset.head_exists = true;
     }
   }
@@ -6188,7 +6258,7 @@ void ReplicatedPG::_make_clone(
   object_info_t *poi)
 {
   bufferlist bv;
-  ::encode(*poi, bv);
+  ::encode(*poi, bv, get_osdmap()->get_up_osd_features());
 
   t->clone(head, coid);
   setattr_maybe_cache(obc, ctx, t, OI_ATTR, bv);
@@ -6491,7 +6561,7 @@ hobject_t ReplicatedPG::generate_temp_object()
 {
   ostringstream ss;
   ss << "temp_" << info.pgid << "_" << get_role() << "_" << osd->monc->get_global_id() << "_" << (++temp_seq);
-  hobject_t hoid = info.pgid.make_temp_object(ss.str());
+  hobject_t hoid = info.pgid.make_temp_hobject(ss.str());
   dout(20) << __func__ << " " << hoid << dendl;
   return hoid;
 }
@@ -6504,7 +6574,7 @@ hobject_t ReplicatedPG::get_temp_recovery_object(eversion_t version, snapid_t sn
      << "_" << info.history.same_interval_since
      << "_" << snap;
   // pgid + version + interval + snapid is unique, and short
-  hobject_t hoid = info.pgid.make_temp_object(ss.str());
+  hobject_t hoid = info.pgid.make_temp_hobject(ss.str());
   dout(20) << __func__ << " " << hoid << dendl;
   return hoid;
 }
@@ -6649,7 +6719,7 @@ void ReplicatedPG::finish_ctx(OpContext *ctx, int log_op_type, bool maintain_ssc
 
       map<string, bufferlist> attrs;
       bufferlist bv(sizeof(ctx->new_obs.oi));
-      ::encode(ctx->snapset_obc->obs.oi, bv);
+      ::encode(ctx->snapset_obc->obs.oi, bv, get_osdmap()->get_up_osd_features());
       ctx->op_t->touch(snapoid);
       attrs[OI_ATTR].claim(bv);
       attrs[SS_ATTR].claim(bss);
@@ -6695,7 +6765,7 @@ void ReplicatedPG::finish_ctx(OpContext *ctx, int log_op_type, bool maintain_ssc
 
     map <string, bufferlist> attrs;
     bufferlist bv(sizeof(ctx->new_obs.oi));
-    ::encode(ctx->new_obs.oi, bv);
+    ::encode(ctx->new_obs.oi, bv, get_osdmap()->get_up_osd_features());
     attrs[OI_ATTR].claim(bv);
 
     if (soid.snap == CEPH_NOSNAP) {
@@ -6790,7 +6860,8 @@ void ReplicatedPG::complete_read_ctx(int result, OpContext *ctx)
   MOSDOp *m = static_cast<MOSDOp*>(ctx->op->get_req());
   assert(ctx->async_reads_complete());
 
-  for (vector<OSDOp>::iterator p = ctx->ops.begin(); p != ctx->ops.end(); ++p) {
+  for (vector<OSDOp>::iterator p = ctx->ops.begin();
+    p != ctx->ops.end() && result >= 0; ++p) {
     if (p->rval < 0 && !(p->op.flags & CEPH_OSD_OP_FLAG_FAILOK)) {
       result = p->rval;
       break;
@@ -6894,10 +6965,6 @@ int ReplicatedPG::fill_in_copy_get(
     return result;
   }
 
-  if ((osd_op.op.copy_get.flags & CEPH_OSD_COPY_GET_FLAG_NOTSUPP_OMAP) &&
-      oi.is_omap())
-      return -EOPNOTSUPP;
-
   MOSDOp *op = reinterpret_cast<MOSDOp*>(ctx->op->get_req());
   uint64_t features = op->get_features();
 
@@ -6951,14 +7018,14 @@ int ReplicatedPG::fill_in_copy_get(
   bufferlist& bl = reply_obj.data;
   if (left > 0 && !cursor.data_complete) {
     if (cursor.data_offset < oi.size) {
-      left = MIN(oi.size - cursor.data_offset, (uint64_t)left);
+      uint64_t max_read = MIN(oi.size - cursor.data_offset, (uint64_t)left);
       if (cb) {
 	async_read_started = true;
 	ctx->pending_async_reads.push_back(
 	  make_pair(
-	    boost::make_tuple(cursor.data_offset, left, osd_op.op.flags),
+	    boost::make_tuple(cursor.data_offset, max_read, osd_op.op.flags),
 	    make_pair(&bl, cb)));
-        result = left;
+        result = max_read;
 	cb->len = result;
       } else {
 	result = pgbackend->objects_read_sync(
@@ -7137,12 +7204,7 @@ void ReplicatedPG::_copy_some(ObjectContextRef obc, CopyOpRef cop)
     // it already!
     assert(cop->cursor.is_initial());
   }
-
-  uint32_t copyget_flags = 0;
-  if (!pool.info.supports_omap())
-   copyget_flags |= CEPH_OSD_COPY_GET_FLAG_NOTSUPP_OMAP;
-
-  op.copy_get(&cop->cursor, get_copy_chunk_size(), copyget_flags,
+  op.copy_get(&cop->cursor, get_copy_chunk_size(),
 	      &cop->results.object_size, &cop->results.mtime,
 	      &cop->attrs, &cop->data, &cop->omap_header, &cop->omap_data,
 	      &cop->results.snaps, &cop->results.snap_seq,
@@ -7304,6 +7366,16 @@ void ReplicatedPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
 
   copy_ops.erase(cobc->obs.oi.soid);
   cobc->stop_block();
+
+  if (r < 0 && cop->results.started_temp_obj) {
+    dout(10) << __func__ << " deleting partial temp object "
+	     << cop->results.temp_oid << dendl;
+    ObjectContextRef tempobc = get_object_context(cop->results.temp_oid, true);
+    OpContextUPtr ctx = simple_opc_create(tempobc);
+    ctx->op_t->remove(cop->results.temp_oid);
+    ctx->discard_temp_oid = cop->results.temp_oid;
+    simple_opc_submit(std::move(ctx));
+  }
 
   // cancel and requeue proxy ops on this object
   if (!r) {
@@ -8359,6 +8431,7 @@ void ReplicatedPG::eval_repop(RepGather *repop)
   if (repop->all_applied && repop->all_committed) {
     repop->rep_done = true;
 
+    publish_stats_to_osd();
     calc_min_last_complete_ondisk();
 
     for (auto p = repop->on_success.begin();
@@ -8383,12 +8456,6 @@ void ReplicatedPG::eval_repop(RepGather *repop)
 void ReplicatedPG::issue_repop(RepGather *repop, OpContext *ctx)
 {
   const hobject_t& soid = ctx->obs->oi.soid;
-  if (ctx->op &&
-    ((static_cast<MOSDOp *>(
-	ctx->op->get_req()))->has_flag(CEPH_OSD_FLAG_PARALLELEXEC))) {
-    // replicate original op for parallel execution on replica
-    assert(0 == "broken implementation, do not use");
-  }
   dout(7) << "issue_repop rep_tid " << repop->rep_tid
           << " o " << soid
           << dendl;
@@ -8748,6 +8815,10 @@ void ReplicatedPG::handle_watch_timeout(WatchRef watch)
   ObjectContextRef obc = watch->get_obc(); // handle_watch_timeout owns this ref
   dout(10) << "handle_watch_timeout obc " << obc << dendl;
 
+  if (!is_active()) {
+    dout(10) << "handle_watch_timeout not active, no-op" << dendl;
+    return;
+  }
   if (is_degraded_or_backfilling_object(obc->obs.oi.soid)) {
     callbacks_for_degraded_object[obc->obs.oi.soid].push_back(
       watch->get_delayed_cb()
@@ -8794,7 +8865,7 @@ void ReplicatedPG::handle_watch_timeout(WatchRef watch)
   oi.prior_version = obc->obs.oi.version;
   oi.version = ctx->at_version;
   bufferlist bl;
-  ::encode(oi, bl);
+  ::encode(oi, bl, get_osdmap()->get_up_osd_features());
   setattr_maybe_cache(obc, ctx.get(), t, OI_ATTR, bl);
 
   if (pool.info.require_rollback()) {
@@ -9232,17 +9303,10 @@ void ReplicatedPG::kick_object_context_blocked(ObjectContextRef obc)
     objects_blocked_on_snap_promotion.erase(i);
   }
 
-  if (obc->requeue_scrub_on_unblock)
+  if (obc->requeue_scrub_on_unblock) {
+    obc->requeue_scrub_on_unblock = false;
     requeue_scrub();
-}
-
-SnapSetContext *ReplicatedPG::create_snapset_context(const hobject_t& oid)
-{
-  Mutex::Locker l(snapset_contexts_lock);
-  SnapSetContext *ssc = new SnapSetContext(oid.get_snapdir());
-  _register_snapset_context(ssc);
-  ssc->ref++;
-  return ssc;
+  }
 }
 
 SnapSetContext *ReplicatedPG::get_snapset_context(
@@ -9271,8 +9335,8 @@ SnapSetContext *ReplicatedPG::get_snapset_context(
 	// try _snapset
       if (!(oid.is_snapdir() && !oid_existed))
 	r = pgbackend->objects_get_attr(oid.get_snapdir(), SS_ATTR, &bv);
-	if (r < 0 && !can_create)
-	  return NULL;
+      if (r < 0 && !can_create)
+	return NULL;
       }
     } else {
       assert(attrs->count(SS_ATTR));
@@ -9606,7 +9670,7 @@ ObjectContextRef ReplicatedPG::mark_object_lost(ObjectStore::Transaction *t,
   obc->obs.oi.prior_version = version;
 
   bufferlist b2;
-  obc->obs.oi.encode(b2);
+  obc->obs.oi.encode(b2, get_osdmap()->get_up_osd_features());
   assert(!pool.info.require_rollback());
   t->setattr(coll, ghobject_t(oid), OI_ATTR, b2);
 
@@ -9784,7 +9848,7 @@ void ReplicatedPG::mark_all_unfound_lost(
     void operator()() {
       pg->requeue_ops(pg->waiting_for_all_missing);
       pg->waiting_for_all_missing.clear();
-      pg->osd->queue_for_recovery(pg);
+      pg->queue_recovery();
     }
   };
   submit_log_entries(
@@ -9794,7 +9858,7 @@ void ReplicatedPG::mark_all_unfound_lost(
       [=]() {
 	requeue_ops(waiting_for_all_missing);
 	waiting_for_all_missing.clear();
-	osd->queue_for_recovery(this);
+	queue_recovery();
 
 	stringstream ss;
 	ss << "pg has " << num_unfound
@@ -9925,7 +9989,6 @@ void ReplicatedPG::on_shutdown()
   dout(10) << "on_shutdown" << dendl;
 
   // remove from queues
-  osd->recovery_wq.dequeue(this);
   osd->pg_stat_queue_dequeue(this);
   osd->dequeue_pg(this, 0);
   osd->peering_wq.dequeue(this);
@@ -10023,6 +10086,11 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
     hit_set_clear();
   }
 
+  if (recovery_queued) {
+    recovery_queued = false;
+    osd->clear_queued_recovery(this);
+  }
+
   // requeue everything in the reverse order they should be
   // reexamined.
   requeue_ops(waiting_for_peered);
@@ -10031,8 +10099,6 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
 
   // requeues waiting_for_active
   scrub_clear_state();
-
-  context_registry_on_change();
 
   cancel_copy_ops(is_primary());
   cancel_flush_ops(is_primary());
@@ -10091,6 +10157,10 @@ void ReplicatedPG::on_change(ObjectStore::Transaction *t)
   // this will requeue ops we were working on but didn't finish, and
   // any dups
   apply_and_flush_repops(is_primary());
+
+  // do this *after* apply_and_flush_repops so that we catch any newly
+  // registered watches.
+  context_registry_on_change();
 
   pgbackend->on_change_cleanup(t);
   scrubber.cleanup_store(t);
@@ -10268,10 +10338,11 @@ void PG::MissingLoc::check_recovery_sources(const OSDMapRef osdmap)
   
 
 bool ReplicatedPG::start_recovery_ops(
-  int max, ThreadPool::TPHandle &handle,
-  int *ops_started)
+  uint64_t max,
+  ThreadPool::TPHandle &handle,
+  uint64_t *ops_started)
 {
-  int& started = *ops_started;
+  uint64_t& started = *ops_started;
   started = 0;
   bool work_in_progress = false;
   assert(is_primary());
@@ -10414,7 +10485,7 @@ bool ReplicatedPG::start_recovery_ops(
  * do one recovery op.
  * return true if done, false if nothing left to do.
  */
-int ReplicatedPG::recover_primary(int max, ThreadPool::TPHandle &handle)
+uint64_t ReplicatedPG::recover_primary(uint64_t max, ThreadPool::TPHandle &handle)
 {
   assert(is_primary());
 
@@ -10427,7 +10498,7 @@ int ReplicatedPG::recover_primary(int max, ThreadPool::TPHandle &handle)
 
   // look at log!
   pg_log_entry_t *latest = 0;
-  int started = 0;
+  unsigned started = 0;
   int skipped = 0;
 
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
@@ -10487,7 +10558,7 @@ int ReplicatedPG::recover_primary(int max, ThreadPool::TPHandle &handle)
 
 	      ObjectStore::Transaction t;
 	      bufferlist b2;
-	      obc->obs.oi.encode(b2);
+	      obc->obs.oi.encode(b2, get_osdmap()->get_up_osd_features());
 	      assert(!pool.info.require_rollback());
 	      t.setattr(coll, ghobject_t(soid), OI_ATTR, b2);
 
@@ -10632,10 +10703,10 @@ int ReplicatedPG::prep_object_replica_pushes(
   return 1;
 }
 
-int ReplicatedPG::recover_replicas(int max, ThreadPool::TPHandle &handle)
+uint64_t ReplicatedPG::recover_replicas(uint64_t max, ThreadPool::TPHandle &handle)
 {
   dout(10) << __func__ << "(" << max << ")" << dendl;
-  int started = 0;
+  uint64_t started = 0;
 
   PGBackend::RecoveryHandle *h = pgbackend->open_recovery_op();
 
@@ -10774,8 +10845,8 @@ bool ReplicatedPG::all_peer_done() const
  * io created objects since the last scan.  For this reason, we call
  * update_range() again before continuing backfill.
  */
-int ReplicatedPG::recover_backfill(
-  int max,
+uint64_t ReplicatedPG::recover_backfill(
+  uint64_t max,
   ThreadPool::TPHandle &handle, bool *work_started)
 {
   dout(10) << "recover_backfill (" << max << ")"
@@ -10836,7 +10907,7 @@ int ReplicatedPG::recover_backfill(
   backfill_info.begin = last_backfill_started;
   update_range(&backfill_info, handle);
 
-  int ops = 0;
+  unsigned ops = 0;
   vector<boost::tuple<hobject_t, eversion_t,
                       ObjectContextRef, vector<pg_shard_t> > > to_push;
   vector<boost::tuple<hobject_t, eversion_t, pg_shard_t> > to_remove;
@@ -10851,9 +10922,6 @@ int ReplicatedPG::recover_backfill(
   }
   backfill_info.trim_to(last_backfill_started);
 
-  hobject_t backfill_pos = MIN_HOBJ(backfill_info.begin,
-				    earliest_peer_backfill(),
-				    get_sort_bitwise());
   while (ops < max) {
     if (cmp(backfill_info.begin, earliest_peer_backfill(),
 	    get_sort_bitwise()) <= 0 &&
@@ -10864,8 +10932,6 @@ int ReplicatedPG::recover_backfill(
       update_range(&backfill_info, handle);
       backfill_info.trim();
     }
-    backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
-			    get_sort_bitwise());
 
     dout(20) << "   my backfill interval " << backfill_info << dendl;
 
@@ -11024,7 +11090,8 @@ int ReplicatedPG::recover_backfill(
       }
     }
   }
-  backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
+
+  hobject_t backfill_pos = MIN_HOBJ(backfill_info.begin, earliest_peer_backfill(),
 			  get_sort_bitwise());
 
   for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = add_to_stat.begin();
@@ -11625,7 +11692,7 @@ void ReplicatedPG::hit_set_persist()
   bufferlist bss;
   ::encode(ctx->new_snapset, bss);
   bufferlist boi(sizeof(ctx->new_obs.oi));
-  ::encode(ctx->new_obs.oi, boi);
+  ::encode(ctx->new_obs.oi, boi, get_osdmap()->get_up_osd_features());
 
   ctx->op_t->append(oid, 0, bl.length(), bl, 0);
   map <string, bufferlist> attrs;
@@ -12211,6 +12278,8 @@ bool ReplicatedPG::agent_choose_mode(bool restart, OpRequestRef op)
   uint64_t num_user_bytes = info.stats.stats.sum.num_bytes;
   uint64_t unflushable_bytes = info.stats.stats.sum.num_bytes_hit_set_archive;
   num_user_bytes -= unflushable_bytes;
+  uint64_t num_overhead_bytes = osd->store->estimate_objects_overhead(num_user_objects);
+  num_user_bytes += num_overhead_bytes;
 
   // also reduce the num_dirty by num_objects_omap
   int64_t num_dirty = info.stats.stats.sum.num_objects_dirty;
@@ -12233,6 +12302,7 @@ bool ReplicatedPG::agent_choose_mode(bool restart, OpRequestRef op)
 	   << " num_dirty: " << num_dirty
 	   << " num_user_objects: " << num_user_objects
 	   << " num_user_bytes: " << num_user_bytes
+	   << " num_overhead_bytes: " << num_overhead_bytes
 	   << " pool.info.target_max_bytes: " << pool.info.target_max_bytes
 	   << " pool.info.target_max_objects: " << pool.info.target_max_objects
 	   << dendl;
@@ -12533,14 +12603,14 @@ void ReplicatedPG::_scrub(
   boost::optional<SnapSet> snapset; // If initialized so will head (above)
   vector<snapid_t>::reverse_iterator curclone; // Defined only if snapset initialized
   unsigned missing = 0;
-  inconsistent_snapset_wrapper snap_error;
+  inconsistent_snapset_wrapper soid_error, head_error;
 
   bufferlist last_data;
 
   for (map<hobject_t,ScrubMap::object, hobject_t::BitwiseComparator>::reverse_iterator
        p = scrubmap.objects.rbegin(); p != scrubmap.objects.rend(); ++p) {
     const hobject_t& soid = p->first;
-    snap_error = inconsistent_snapset_wrapper{soid};
+    soid_error = inconsistent_snapset_wrapper{soid};
     object_stat_sum_t stat;
     boost::optional<object_info_t> oi;
 
@@ -12561,7 +12631,7 @@ void ReplicatedPG::_scrub(
       osd->clog->error() << mode << " " << info.pgid << " " << soid
 			<< " no '" << OI_ATTR << "' attr";
       ++scrubber.shallow_errors;
-      snap_error.set_ss_attr_missing();
+      soid_error.set_oi_attr_missing();
     } else {
       bufferlist bv;
       bv.push_back(p->second.attrs[OI_ATTR]);
@@ -12573,7 +12643,8 @@ void ReplicatedPG::_scrub(
 	osd->clog->error() << mode << " " << info.pgid << " " << soid
 		<< " can't decode '" << OI_ATTR << "' attr " << e.what();
 	++scrubber.shallow_errors;
-	snap_error.set_ss_attr_corrupted();
+	soid_error.set_oi_attr_corrupted();
+        soid_error.set_oi_attr_missing(); // Not available too
       }
     }
 
@@ -12585,7 +12656,7 @@ void ReplicatedPG::_scrub(
 			   << oi->size << ") adjusted for ondisk to ("
 			   << pgbackend->be_get_ondisk_size(oi->size)
 			   << ")";
-	snap_error.set_size_mismatch();
+	soid_error.set_size_mismatch();
 	++scrubber.shallow_errors;
       }
 
@@ -12629,7 +12700,7 @@ void ReplicatedPG::_scrub(
       // This will set missing, but will be a no-op if snap.soid == *curclone.
       missing += process_clones_to(head, snapset, osd->clog, info.pgid, mode,
 		        pool.info.allow_incomplete_clones(), target, &curclone,
-			snap_error);
+			head_error);
     }
     bool expected;
     // Check doing_clones() again in case we ran process_clones_to()
@@ -12645,19 +12716,18 @@ void ReplicatedPG::_scrub(
       expected = soid.has_snapset();
     }
     if (!expected) {
-      // If we couldn't read the head's snapset, then just ignore clones and
-      // don't count as an error.
+      // If we couldn't read the head's snapset, just ignore clones
       if (head && !snapset) {
-	osd->clog->info() << mode << " " << info.pgid << " " << soid
+	osd->clog->error() << mode << " " << info.pgid << " " << soid
 			  << " clone ignored due to missing snapset";
-	scrubber.store->add_snap_error(pool.id, snap_error);
-	continue;
-      }
-      osd->clog->error() << mode << " " << info.pgid << " " << soid
+      } else {
+	osd->clog->error() << mode << " " << info.pgid << " " << soid
 			   << " is an unexpected clone";
+      }
       ++scrubber.shallow_errors;
-      snap_error.set_headless();
-      scrubber.store->add_snap_error(pool.id, snap_error);
+      soid_error.set_headless();
+      scrubber.store->add_snap_error(pool.id, soid_error);
+      head_error.set_clone(soid.snap);
       continue;
     }
 
@@ -12667,13 +12737,15 @@ void ReplicatedPG::_scrub(
       if (missing) {
 	log_missing(missing, head, osd->clog, info.pgid, __func__, mode,
 		    pool.info.allow_incomplete_clones());
-	scrubber.store->add_snap_error(pool.id, snap_error);
       }
 
+      // Save previous head error information
+      if (head && head_error.errors)
+	scrubber.store->add_snap_error(pool.id, head_error);
       // Set this as a new head object
       head = soid;
       missing = 0;
-      snap_error = inconsistent_snapset_wrapper{head.get()};
+      head_error = soid_error;
 
       dout(20) << __func__ << " " << mode << " new head " << head << dendl;
 
@@ -12682,7 +12754,7 @@ void ReplicatedPG::_scrub(
 			  << " no '" << SS_ATTR << "' attr";
         ++scrubber.shallow_errors;
 	snapset = boost::none;
-	snap_error.set_ss_attr_missing();
+	head_error.set_ss_attr_missing();
       } else {
 	bufferlist bl;
 	bl.push_back(p->second.attrs[SS_ATTR]);
@@ -12695,7 +12767,8 @@ void ReplicatedPG::_scrub(
           osd->clog->error() << mode << " " << info.pgid << " " << soid
 		<< " can't decode '" << SS_ATTR << "' attr " << e.what();
 	  ++scrubber.shallow_errors;
-	  snap_error.set_ss_attr_corrupted();
+	  head_error.set_ss_attr_corrupted();
+	  head_error.set_ss_attr_missing(); // Not available too
         }
       }
 
@@ -12709,7 +12782,7 @@ void ReplicatedPG::_scrub(
 	    osd->clog->error() << mode << " " << info.pgid << " " << soid
 			       << " snaps.seq not set";
 	    ++scrubber.shallow_errors;
-	    snap_error.set_snapset_mismatch();
+	    head_error.set_snapset_mismatch();
           }
 	}
 
@@ -12717,13 +12790,13 @@ void ReplicatedPG::_scrub(
 	  osd->clog->error() << mode << " " << info.pgid << " " << soid
 			  << " snapset.head_exists=false, but head exists";
 	  ++scrubber.shallow_errors;
-	  snap_error.set_head_mismatch();
+	  head_error.set_head_mismatch();
 	}
 	if (soid.is_snapdir() && snapset->head_exists) {
 	  osd->clog->error() << mode << " " << info.pgid << " " << soid
 			  << " snapset.head_exists=true, but snapdir exists";
 	  ++scrubber.shallow_errors;
-	  snap_error.set_head_mismatch();
+	  head_error.set_head_mismatch();
 	}
       }
     } else {
@@ -12738,21 +12811,21 @@ void ReplicatedPG::_scrub(
 	osd->clog->error() << mode << " " << info.pgid << " " << soid
 			   << " is missing in clone_size";
 	++scrubber.shallow_errors;
-	snap_error.set_size_mismatch();
+	soid_error.set_size_mismatch();
       } else {
         if (oi && oi->size != snapset->clone_size[soid.snap]) {
 	  osd->clog->error() << mode << " " << info.pgid << " " << soid
 			     << " size " << oi->size << " != clone_size "
 			     << snapset->clone_size[*curclone];
 	  ++scrubber.shallow_errors;
-	  snap_error.set_size_mismatch();
+	  soid_error.set_size_mismatch();
         }
 
         if (snapset->clone_overlap.count(soid.snap) == 0) {
 	  osd->clog->error() << mode << " " << info.pgid << " " << soid
 			     << " is missing in clone_overlap";
 	  ++scrubber.shallow_errors;
-	  snap_error.set_size_mismatch();
+	  soid_error.set_size_mismatch();
 	} else {
 	  // This checking is based on get_clone_bytes().  The first 2 asserts
 	  // can't happen because we know we have a clone_size and
@@ -12775,7 +12848,7 @@ void ReplicatedPG::_scrub(
 	    osd->clog->error() << mode << " " << info.pgid << " " << soid
 			       << " bad interval_set in clone_overlap";
 	    ++scrubber.shallow_errors;
-	    snap_error.set_size_mismatch();
+	    soid_error.set_size_mismatch();
 	  } else {
             stat.num_bytes += snapset->get_clone_bytes(soid.snap);
 	  }
@@ -12784,6 +12857,8 @@ void ReplicatedPG::_scrub(
 
       // what's next?
       ++curclone;
+      if (soid_error.errors)
+        scrubber.store->add_snap_error(pool.id, soid_error);
     }
 
     scrub_cstat.add(stat);
@@ -12795,15 +12870,16 @@ void ReplicatedPG::_scrub(
 
     missing += process_clones_to(head, snapset, osd->clog, info.pgid, mode,
 		      pool.info.allow_incomplete_clones(), all_clones, &curclone,
-		      snap_error);
+		      head_error);
   }
   // There could be missing found by the test above or even
   // before dropping out of the loop for the last head.
   if (missing) {
     log_missing(missing, head, osd->clog, info.pgid, __func__,
 		mode, pool.info.allow_incomplete_clones());
-    scrubber.store->add_snap_error(pool.id, snap_error);
   }
+  if (head && head_error.errors)
+    scrubber.store->add_snap_error(pool.id, head_error);
 
   for (map<hobject_t,pair<uint32_t,uint32_t>, hobject_t::BitwiseComparator>::const_iterator p =
 	 missing_digest.begin();

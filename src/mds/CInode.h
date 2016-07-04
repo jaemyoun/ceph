@@ -288,6 +288,10 @@ public:
       scrub_info_create();
     return scrub_infop;
   }
+
+  bool scrub_is_in_progress() const {
+    return (scrub_infop && scrub_infop->scrub_in_progress);
+  }
   /**
    * Start scrubbing on this inode. That could be very short if it's
    * a file, or take a long time if we're recursively scrubbing a directory.
@@ -571,7 +575,7 @@ protected:
 
   ceph_lock_state_t *get_fcntl_lock_state() {
     if (!fcntl_locks)
-      fcntl_locks = new ceph_lock_state_t(g_ceph_context);
+      fcntl_locks = new ceph_lock_state_t(g_ceph_context, CEPH_LOCK_FCNTL);
     return fcntl_locks;
   }
   void clear_fcntl_lock_state() {
@@ -580,7 +584,7 @@ protected:
   }
   ceph_lock_state_t *get_flock_lock_state() {
     if (!flock_locks)
-      flock_locks = new ceph_lock_state_t(g_ceph_context);
+      flock_locks = new ceph_lock_state_t(g_ceph_context, CEPH_LOCK_FLOCK);
     return flock_locks;
   }
   void clear_flock_lock_state() {
@@ -734,7 +738,7 @@ public:
 
   // -- misc -- 
   bool is_projected_ancestor_of(CInode *other);
-  void make_path_string(std::string& s, bool force=false, CDentry *use_parent=NULL) const;
+  void make_path_string(std::string& s, CDentry *use_parent=NULL) const;
   void make_path_string_projected(std::string& s) const;
   void make_path(filepath& s) const;
   void name_stray_dentry(std::string& dname);
@@ -765,6 +769,15 @@ public:
   void store_backtrace(MDSInternalContextBase *fin, int op_prio=-1);
   void _stored_backtrace(int r, version_t v, Context *fin);
   void fetch_backtrace(Context *fin, bufferlist *backtrace);
+protected:
+  /**
+   * Return the pool ID where we currently write backtraces for
+   * this inode (in addition to inode.old_pools)
+   *
+   * @returns a pool ID >=0
+   */
+  int64_t get_backtrace_pool() const;
+public:
   void _mark_dirty_parent(LogSegment *ls, bool dirty_pool=false);
   void clear_dirty_parent();
   void verify_diri_backtrace(bufferlist &bl, int err);

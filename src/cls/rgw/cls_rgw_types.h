@@ -4,14 +4,16 @@
 #include <map>
 
 #include "include/types.h"
-#include "include/utime.h"
+#include "common/ceph_time.h"
 #include "common/Formatter.h"
 
 #include "rgw/rgw_basic_types.h"
 
 #define CEPH_RGW_REMOVE 'r'
 #define CEPH_RGW_UPDATE 'u'
-#define CEPH_RGW_TAG_TIMEOUT 60*60*24
+#define CEPH_RGW_TAG_TIMEOUT 120
+#define CEPH_RGW_DIR_SUGGEST_LOG_OP  0x80
+#define CEPH_RGW_DIR_SUGGEST_OP_MASK 0x7f
 
 class JSONObj;
 
@@ -49,7 +51,7 @@ enum RGWCheckMTimeType {
 
 struct rgw_bucket_pending_info {
   RGWPendingState state;
-  utime_t timestamp;
+  ceph::real_time timestamp;
   uint8_t op;
 
   rgw_bucket_pending_info() : state(CLS_RGW_STATE_PENDING_MODIFY), op(0) {}
@@ -80,7 +82,7 @@ WRITE_CLASS_ENCODER(rgw_bucket_pending_info)
 struct rgw_bucket_dir_entry_meta {
   uint8_t category;
   uint64_t size;
-  utime_t mtime;
+  ceph::real_time mtime;
   string etag;
   string owner;
   string owner_display_name;
@@ -88,7 +90,7 @@ struct rgw_bucket_dir_entry_meta {
   uint64_t accounted_size;
 
   rgw_bucket_dir_entry_meta() :
-  category(0), size(0), accounted_size(0) { mtime.set_from_double(0); }
+  category(0), size(0), accounted_size(0) { }
 
   void encode(bufferlist &bl) const {
     ENCODE_START(4, 3, bl);
@@ -474,7 +476,7 @@ struct rgw_bi_log_entry {
   string id;
   string object;
   string instance;
-  utime_t timestamp;
+  ceph::real_time timestamp;
   rgw_bucket_entry_ver ver;
   RGWModifyOp op;
   RGWPendingState state;
@@ -891,7 +893,7 @@ struct cls_rgw_gc_obj_info
 {
   string tag;
   cls_rgw_obj_chain chain;
-  utime_t time;
+  ceph::real_time time;
 
   cls_rgw_gc_obj_info() {}
 
@@ -922,7 +924,8 @@ struct cls_rgw_gc_obj_info
     ls.push_back(new cls_rgw_gc_obj_info);
     ls.push_back(new cls_rgw_gc_obj_info);
     ls.back()->tag = "footag";
-    ls.back()->time = utime_t(21, 32);
+    ceph_timespec ts{21, 32};
+    ls.back()->time = ceph::real_clock::from_ceph_timespec(ts);
   }
 };
 WRITE_CLASS_ENCODER(cls_rgw_gc_obj_info)

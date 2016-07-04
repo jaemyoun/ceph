@@ -572,6 +572,25 @@ void EMetaBlob::fullbit::update_inode(MDSRank *mds, CInode *in)
    */
   in->oldest_snap = oldest_snap;
   in->decode_snap_blob(snapbl);
+
+  /*
+   * In case there was anything malformed in the journal that we are
+   * replaying, do sanity checks on the inodes we're replaying and
+   * go damaged instead of letting any trash into a live cache
+   */
+  if (in->is_file()) {
+    // Files must have valid layouts with a pool set
+    if (in->inode.layout.pool_id == -1 || !in->inode.layout.is_valid()) {
+      dout(0) << "EMetaBlob.replay invalid layout on ino " << *in
+              << ": " << in->inode.layout << dendl;
+      std::ostringstream oss;
+      oss << "Invalid layout for inode 0x" << std::hex << in->inode.ino
+          << std::dec << " in journal";
+      mds->clog->error() << oss.str();
+      mds->damaged();
+      assert(0);  // Should be unreachable because damaged() calls respawn()
+    }
+  }
 }
 
 // EMetaBlob::remotebit
@@ -1706,7 +1725,7 @@ void ESession::encode(bufferlist &bl, uint64_t features) const
 {
   ENCODE_START(4, 3, bl);
   ::encode(stamp, bl);
-  ::encode(client_inst, bl);
+  ::encode(client_inst, bl, features);
   ::encode(open, bl);
   ::encode(cmapv, bl);
   ::encode(inos, bl);
@@ -1757,7 +1776,7 @@ void ESession::generate_test_instances(list<ESession*>& ls)
 void ESessions::encode(bufferlist &bl, uint64_t features) const
 {
   ENCODE_START(1, 1, bl);
-  ::encode(client_map, bl);
+  ::encode(client_map, bl, features);
   ::encode(cmapv, bl);
   ::encode(stamp, bl);
   ENCODE_FINISH(bl);
@@ -3101,7 +3120,7 @@ void ENoOp::replay(MDSRank *mds)
  * @param mds
  * MDSRank instance, just used for logging
  * @param old_to_new
- * Map of old journal segment segment sequence numbers to new journal segment sequence numbers
+ * Map of old journal segment sequence numbers to new journal segment sequence numbers
  *
  * @return
  * True if the event was modified.

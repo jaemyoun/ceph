@@ -19,40 +19,80 @@ if test $(id -u) != 0 ; then
 fi
 export LC_ALL=C # the following is vulnerable to i18n
 
+if [ x`uname`x = xFreeBSDx ]; then
+    $SUDO pkg install -yq \
+        devel/git \
+        devel/gmake \
+        devel/automake \
+        devel/yasm \
+        devel/boost-all \
+        devel/valgrind \
+        devel/pkgconf \
+        devel/libatomic_ops \
+        devel/libedit \
+        devel/libtool \
+        devel/google-perftools \
+        lang/cython \
+        devel/py-virtualenv \
+        databases/leveldb \
+	net/openldap24-client \
+        security/nss \
+        security/cryptopp \
+        archivers/snappy \
+        ftp/curl \
+        misc/e2fsprogs-libuuid \
+        textproc/expat2 \
+        textproc/libxml2 \
+        textproc/xmlstarlet \
+        emulators/fuse \
+        java/junit \
+        lang/python27 \
+        devel/py-argparse \
+        devel/py-nose \
+        www/py-flask \
+        www/fcgi \
+        sysutils/flock \
+
+    exit
+fi
+
 if test -f /etc/redhat-release ; then
     $SUDO yum install -y redhat-lsb-core
 fi
 
 if type apt-get > /dev/null 2>&1 ; then
-    $SUDO apt-get install -y lsb-release
+    $SUDO apt-get install -y lsb-release devscripts equivs
 fi
 
 if type zypper > /dev/null 2>&1 ; then
-    $SUDO zypper --gpg-auto-import-keys --non-interactive install lsb-release
+    $SUDO zypper --gpg-auto-import-keys --non-interactive install lsb-release systemd-rpm-macros
 fi
 
 case $(lsb_release -si) in
 Ubuntu|Debian|Devuan)
-        $SUDO apt-get install -y dpkg-dev
+        $SUDO apt-get install -y dpkg-dev gcc
         if ! test -r debian/control ; then
             echo debian/control is not a readable file
             exit 1
         fi
         touch $DIR/status
-        packages=$(dpkg-checkbuilddeps --admindir=$DIR debian/control 2>&1 | \
-            perl -p -e 's/.*Unmet build dependencies: *//;' \
-            -e 's/build-essential:native/build-essential/;' \
-            -e 's/\s*\|\s*/\|/g;' \
-            -e 's/\(.*?\)//g;' \
-            -e 's/ +/\n/g;' | sort)
+
+	backports=""
+	control="debian/control"
         case $(lsb_release -sc) in
             squeeze|wheezy)
-                packages=$(echo $packages | perl -pe 's/[-\w]*babeltrace[-\w]*//g')
+		control="/tmp/control.$$"
+		grep -v babeltrace debian/control > $control
                 backports="-t $(lsb_release -sc)-backports"
                 ;;
         esac
-        packages=$(echo $packages) # change newlines into spaces
-        $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install $backports -y $packages || exit 1
+
+	# make a metapackage that expresses the build dependencies,
+	# install it, rm the .deb; then uninstall the package as its
+	# work is done
+	$SUDO env DEBIAN_FRONTEND=noninteractive mk-build-deps --install --remove --tool="apt-get -y --no-install-recommends $backports" $control || exit 1
+	$SUDO env DEBIAN_FRONTEND=noninteractive apt-get -y remove ceph-build-deps
+	if [ -n "$backports" ] ; then rm $control; fi
         ;;
 CentOS|Fedora|RedHatEnterpriseServer)
         case $(lsb_release -si) in
@@ -66,7 +106,7 @@ CentOS|Fedora|RedHatEnterpriseServer)
                     $SUDO yum install subscription-manager
                     $SUDO subscription-manager repos --enable=rhel-$MAJOR_VERSION-server-optional-rpms
                 fi
-                $SUDO yum-config-manager --add-repo https://dl.fedoraproject.org/pub/epel/$MAJOR_VERSION/x86_64/ 
+                $SUDO yum-config-manager --add-repo https://dl.fedoraproject.org/pub/epel/$MAJOR_VERSION/x86_64/
                 $SUDO yum install --nogpgcheck -y epel-release
                 $SUDO rpm --import /etc/pki/rpm-gpg/RPM-GPG-KEY-EPEL-$MAJOR_VERSION
                 $SUDO rm -f /etc/yum.repos.d/dl.fedoraproject.org*
@@ -92,8 +132,6 @@ function populate_wheelhouse() {
     local install=$1
     shift
 
-    # Ubuntu-12.04 and Python 2.7.3 require this line
-    pip --timeout 300 $install 'distribute >= 0.7.3' || return 1
     # although pip comes with virtualenv, having a recent version
     # of pip matters when it comes to using wheel packages
     pip --timeout 300 $install 'setuptools >= 0.8' 'pip >= 7.0' 'wheel >= 0.24' || return 1

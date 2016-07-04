@@ -55,8 +55,8 @@ Scope     Lead            GitHub nick
 Ceph      Sage Weil       liewegas
 RADOS     Samuel Just     athanatos
 RGW       Yehuda Sadeh    yehudasa
-RBD       Josh Durgin     jdurgin
-CephFS    Gregory Farnum  gregsfortytwo
+RBD       Jason Dillaman  dillaman
+CephFS    John Spray      jcsp
 Build/Ops Ken Dreyer      ktdreyer
 ========= =============== =============
 
@@ -178,6 +178,145 @@ with::
     ./ceph health
 
 For more ``vstart.sh`` examples, see :doc:`/dev/quick_guide`.
+
+What is merged where and when ?
+===============================
+
+Commits are merged into branches according to criteria that change
+during the lifecycle of a Ceph release. This chapter is the inventory
+of what can be merged in which branch at a given point in time.
+
+Development releases (i.e. x.0.z)
+---------------------------------
+
+What ?
+^^^^^^
+
+* features
+* bug fixes
+
+Where ?
+^^^^^^^
+
+Features are merged to the master branch. Bug fixes should be merged
+to the corresponding named branch (e.g. "jewel" for 10.0.z, "kraken"
+for 11.0.z, etc.). However, this is not mandatory - bug fixes can be
+merged to the master branch as well, since the master branch is
+periodically merged to the named branch during the development
+releases phase. In either case, if the bugfix is important it can also
+be flagged for backport to one or more previous stable releases.
+
+When ?
+^^^^^^
+
+After the stable release candidates of the previous release enters
+phase 2 (see below).  For example: the "jewel" named branch was
+created when the infernalis release candidates entered phase 2. From
+this point on, master was no longer associated with infernalis. As
+soon as the named branch of the next stable release is created, master
+starts getting periodically merged into it.
+
+Branch merges
+^^^^^^^^^^^^^
+
+* The branch of the stable release is merged periodically into master.
+* The master branch is merged periodically into the branch of the
+  stable release.
+* The master is merged into the branch of the stable release
+  immediately after each development x.0.z release.
+  
+Stable release candidates (i.e. x.1.z) phase 1
+----------------------------------------------
+
+What ?
+^^^^^^
+
+* bug fixes only
+
+Where ?
+^^^^^^^
+
+The branch of the stable release (e.g. "jewel" for 10.0.z, "kraken"
+for 11.0.z, etc.) or master.  Bug fixes should be merged to the named
+branch corresponding to the stable release candidate (e.g. "jewel" for
+10.1.z) or to master. During this phase, all commits to master will be
+merged to the named branch, and vice versa. In other words, it makes
+no difference whether a commit is merged to the named branch or to
+master - it will make it into the next release candidate either way.
+
+When ?
+^^^^^^
+
+After the first stable release candidate is published, i.e. after the
+x.1.0 tag is set in the release branch.
+
+Branch merges
+^^^^^^^^^^^^^
+
+* The branch of the stable release is merged periodically into master.
+* The master branch is merged periodically into the branch of the
+  stable release.
+* The master is merged into the branch of the stable release
+  immediately after each x.1.z release candidate.
+
+Stable release candidates (i.e. x.1.z) phase 2
+----------------------------------------------
+
+What ?
+^^^^^^
+
+* bug fixes only
+
+Where ?
+^^^^^^^
+
+The branch of the stable release (e.g. "jewel" for 10.0.z, "kraken"
+for 11.0.z, etc.). During this phase, all commits to the named branch
+will be merged into master. Cherry-picking to the named branch during
+release candidate phase 2 is done manually since the official
+backporting process only begins when the release is pronounced
+"stable".
+
+When ?
+^^^^^^
+
+After Sage Weil decides it is time for phase 2 to happen.
+
+Branch merges
+^^^^^^^^^^^^^
+
+* The branch of the stable release is merged periodically into master.
+
+Stable releases (i.e. x.2.z)
+----------------------------
+
+What ?
+^^^^^^
+
+* bug fixes
+* features are sometime accepted
+* commits should be cherry-picked from master when possible
+* commits that are not cherry-picked from master must be about a bug unique to the stable release
+* see also `the backport HOWTO`_
+
+.. _`the backport HOWTO`:
+  http://tracker.ceph.com/projects/ceph-releases/wiki/HOWTO#HOWTO
+
+Where ?
+^^^^^^^
+
+The branch of the stable release (hammer for 0.94.x, infernalis for 9.2.x, etc.)
+
+When ?
+^^^^^^
+
+After the stable release is published, i.e. after the "vx.2.0" tag is
+set in the release branch.
+
+Branch merges
+^^^^^^^^^^^^^
+
+Never
 
 Issue tracker
 =============
@@ -340,7 +479,7 @@ Next, create a branch for the bugfix:
 .. code::
 
     $ git checkout master
-    $ git branch -b fix_1
+    $ git checkout -b fix_1
     $ git push -u origin fix_1
 
 This creates a ``fix_1`` branch locally and in our GitHub fork. At this
@@ -674,11 +813,11 @@ results allows reviewers to verify that changes to the code base do not
 cause regressions, or to analyze test failures when they do occur.
 
 Every teuthology cluster, whether bare-metal or cloud-provisioned, has a
-so-called "teuthology node" from which tests suites are triggered using the
+so-called "teuthology machine" from which tests suites are triggered using the
 `teuthology-suite`_ command.
 
 A detailed and up-to-date description of each `teuthology-suite`_ option is
-available by running the following command on the teuthology node::
+available by running the following command on the teuthology machine::
 
    $ teuthology-suite --help
 
@@ -957,7 +1096,7 @@ Reducing the number of tests
 The ``rados`` suite generates thousands of tests out of a few hundred
 files. For instance, all tests in the `rados/thrash suite
 <https://github.com/ceph/ceph-qa-suite/tree/master/suites/rados/thrash>`_
-run for ``ext4``, ``xfs`` and ``btrfs`` because they are combined (via
+run for ``xfs``, ``btrfs`` and ``ext4`` because they are combined (via
 special file ``%``) with the `fs directory
 <https://github.com/ceph/ceph-qa-suite/tree/master/suites/rados/thrash/fs>`_
 
@@ -968,11 +1107,12 @@ reduce the number of tests that are triggered. For instance::
 
   teuthology-suite --suite rados --subset 0/4000
 
-will run as few tests as possible. The tradeoff in this case is that some tests
-will only run on ``ext4`` and not on ``btrfs``, but no matter how small a
-ratio is provided in the ``--subset``, teuthology will still ensure that
-all files in the suite are in at least one test. Understanding the actual
-logic that drives this requires reading the teuthology source code.
+will run as few tests as possible. The tradeoff in this case is that
+some tests will only run on ``xfs`` and not on ``ext4`` or ``btrfs``,
+but no matter how small a ratio is provided in the ``--subset``,
+teuthology will still ensure that all files in the suite are in at
+least one test. Understanding the actual logic that drives this
+requires reading the teuthology source code.
 
 The ``--limit`` option only runs the first ``N`` tests in the suite:
 this is rarely useful, however, because there is no way to control which
@@ -1068,7 +1208,7 @@ The last bit of output should look something like this::
 What this means is that `ceph-workbench ceph-qa-suite`_ triggered the test
 suite run. It does not mean that the suite run has completed. To monitor
 progress of the run, check the Pulpito web interface URL periodically, or
-if you are impatient, ssh to the teuthology node using the ssh command
+if you are impatient, ssh to the teuthology machine using the ssh command
 shown and do::
 
     $ tail -f /var/log/teuthology.*
@@ -1096,6 +1236,87 @@ The first run of a suite will also take a long time, because ceph packages
 have to be built, first. Again, the packages so built are cached and
 `ceph-workbench ceph-qa-suite`_ will not build identical packages a second
 time.
+
+Interrupt a running suite
+-------------------------
+
+Teuthology suites take time to run. From time to time one may wish to
+interrupt a running suite. One obvious way to do this is::
+
+    ceph-workbench ceph-qa-suite --teardown
+
+This destroys all VMs created by `ceph-workbench ceph-qa-suite`_ and
+returns the OpenStack tenant to a "clean slate".
+
+Sometimes you may wish to interrupt the running suite, but keep the logs,
+the teuthology VM, the packages-repository VM, etc. To do this, you can
+``ssh`` to the teuthology VM (using the ``ssh access`` command reported
+when you triggered the suite -- see `Run the dummy suite`_) and, once
+there::
+
+    sudo /etc/init.d/teuthology restart
+
+This will keep the teuthology machine, the logs and the packages-repository
+instance but nuke everything else.
+
+Deploy a cluster for manual testing
+-----------------------------------
+
+The `teuthology framework`_ and `ceph-workbench ceph-qa-suite`_ are 
+versatile tools that automatically provision Ceph clusters in the cloud and
+run various tests on them in an automated fashion. This enables a single
+engineer, in a matter of hours, to perform thousands of tests that would
+keep dozens of human testers occupied for days or weeks if conducted
+manually.
+
+However, there are times when the automated tests do not cover a particular
+scenario and manual testing is desired. It turns out that it is simple to
+adapt a test to stop and wait after the Ceph installation phase, and the
+engineer can then ssh into the running cluster.
+
+This common use case is currently provided for by the following command::
+
+   ceph-workbench ceph-qa-suite --simultaneous-jobs 9 --verbose
+   --teuthology-git-url http://github.com/dachary/teuthology
+   --teuthology-branch openstack --ceph-qa-suite-git-url
+   http://github.com/dachary/ceph-qa-suite --suite-branch wip-ceph-disk
+   --ceph-git-url http://github.com/ceph/ceph --ceph jewel --suite
+   ceph-disk --filter ubuntu_14
+
+This builds packages from the Ceph git repository and branch specified in
+the ``--ceph-git-url`` and ``--ceph`` options, respectively, provisions VMs
+in OpenStack, installs the packages, and deploys a Ceph cluster on them.
+Then, instead of running automated tests, it stops and enters a wait loop.
+
+The VMs (or "instances" in OpenStack terminology) created by
+`ceph-workbench ceph-qa-suite`_ are named as follows:
+
+``teuthology`` - the teuthology machine
+
+``packages-repository`` - VM where packages are stored
+
+``ceph-*`` - VM where packages are built
+
+``target*`` - machines where tests are run
+
+The VMs named ``target*`` are used by tests. If you are monitoring the
+teuthology log for a given test, the hostnames of these target machines can
+be found out by searching for the string ``Locked targets``::
+
+    2016-03-20T11:39:06.166 INFO:teuthology.task.internal:Locked targets:
+      target149202171058.teuthology: null
+      target149202171059.teuthology: null
+
+The IP addresses of the target machines can be found by running
+``openstack server list`` on the teuthology machine.
+
+The whole process, which takes some time to complete, can be monitored as
+described in `Run the dummy suite`_. Be patient.
+
+Once the target machines are up and running and the test enters its wait
+loop, the engineer can ssh into the target machines and do whatever manual
+testing is required. Use the teuthology machine as jump host.
+
 
 .. WIP
 .. ===

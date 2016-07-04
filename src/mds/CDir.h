@@ -35,7 +35,6 @@
 
 class CDentry;
 class MDCache;
-class MDCluster;
 class bloom_filter;
 
 struct ObjectOperation;
@@ -448,16 +447,11 @@ protected:
 
   // -- dentries and inodes --
  public:
-  CDentry* lookup_exact_snap(const std::string& dname, snapid_t last) {
-    map_t::iterator p = items.find(dentry_key_t(last, dname.c_str()));
-    if (p == items.end())
-      return NULL;
-    return p->second;
+  CDentry* lookup_exact_snap(const std::string& dname, snapid_t last);
+  CDentry* lookup(const std::string& n, snapid_t snap=CEPH_NOSNAP);
+  CDentry* lookup(const char *n, snapid_t snap=CEPH_NOSNAP) {
+    return lookup(std::string(n), snap);
   }
-  CDentry* lookup(const std::string& n, snapid_t snap=CEPH_NOSNAP) {
-    return lookup(n.c_str(), snap);
-  }
-  CDentry* lookup(const char *n, snapid_t snap=CEPH_NOSNAP);
 
   CDentry* add_null_dentry(const std::string& dname, 
 			   snapid_t first=2, snapid_t last=CEPH_NOSNAP);
@@ -606,8 +600,11 @@ private:
   }
   void fetch(MDSInternalContextBase *c, bool ignore_authpinnability=false);
   void fetch(MDSInternalContextBase *c, const std::string& want_dn, bool ignore_authpinnability=false);
+  void fetch(MDSInternalContextBase *c, const std::set<dentry_key_t>& keys);
 protected:
-  void _omap_fetch(const std::string& want_dn);
+  compact_set<string> wanted_items;
+
+  void _omap_fetch(MDSInternalContextBase *fin, const std::set<dentry_key_t>& keys);
   CDentry *_load_dentry(
       const std::string &key,
       const std::string &dname,
@@ -631,12 +628,10 @@ protected:
   /**
    * Go bad due to a damaged header (register with damagetable and go BADFRAG)
    */
-  void go_bad();
+  void go_bad(bool complete);
 
   void _omap_fetched(bufferlist& hdrbl, std::map<std::string, bufferlist>& omap,
-		     const std::string& want_dn, int r);
-  void _tmap_fetch(const std::string& want_dn);
-  void _tmap_fetched(bufferlist &bl, const std::string& want_dn, int r);
+		     bool complete, int r);
 
   // -- commit --
   compact_map<version_t, std::list<MDSInternalContextBase*> > waiting_for_commit;

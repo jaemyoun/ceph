@@ -10,6 +10,7 @@
 #include "common/ceph_crypto_cms.h"
 #include "common/armor.h"
 #include "common/strtol.h"
+#include "include/str_list.h"
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -20,6 +21,22 @@ int RGWRESTSimpleRequest::get_status()
     return retcode;
   }
   return status;
+}
+
+int RGWRESTSimpleRequest::handle_header(const string& name, const string& val) 
+{
+  if (name == "CONTENT_LENGTH") {
+    string err;
+    long len = strict_strtol(val.c_str(), 10, &err);
+    if (!err.empty()) {
+      ldout(cct, 0) << "ERROR: failed converting content length (" << val << ") to int " << dendl;
+      return -EINVAL;
+    }
+
+    max_response = len;
+  }
+
+  return 0;
 }
 
 int RGWRESTSimpleRequest::receive_header(void *ptr, size_t len)
@@ -143,10 +160,14 @@ int RGWRESTSimpleRequest::send_data(void *ptr, size_t len)
 
 int RGWRESTSimpleRequest::receive_data(void *ptr, size_t len)
 {
-  if (response.length() > max_response)
+  size_t cp_len, left_len;
+
+  left_len = max_response > response.length() ? (max_response - response.length()) : 0;
+  if (left_len == 0)
     return 0; /* don't read extra data */
 
-  bufferptr p((char *)ptr, len);
+  cp_len = (len > left_len) ? left_len : len;
+  bufferptr p((char *)ptr, cp_len);
 
   response.append(p);
 
@@ -179,7 +200,7 @@ void RGWRESTSimpleRequest::get_params_str(map<string, string>& extra_args, strin
   for (miter = extra_args.begin(); miter != extra_args.end(); ++miter) {
     append_param(dest, miter->first, miter->second);
   }
-  list<pair<string, string> >::iterator iter;
+  param_vec_t::iterator iter;
   for (iter = params.begin(); iter != params.end(); ++iter) {
     append_param(dest, iter->first, iter->second);
   }
@@ -271,8 +292,13 @@ int RGWRESTSimpleRequest::forward_request(RGWAccessKey& key, req_info& info, siz
   }
 
   int r = process(new_info.method, new_url.c_str());
-  if (r < 0)
+  if (r < 0){
+    if (r == -EINVAL){
+      // curl_easy has errored, generally means the service is not available
+      r = -ERR_SERVICE_UNAVAILABLE;
+    }
     return r;
+  }
 
   response.append((char)0); /* NULL terminate response */
 
@@ -532,25 +558,54 @@ void set_str_from_headers(map<string, string>& out_headers, const string& header
   }
 }
 
-int RGWRESTStreamWriteRequest::complete(string& etag, time_t *mtime)
+static int parse_rgwx_mtime(CephContext *cct, const string& s, ceph::real_time *rt)
+{
+  string err;
+  vector<string> vec;
+
+  get_str_vec(s, ".", vec);
+
+  if (vec.empty()) {
+    return -EINVAL;
+  }
+
+  long secs = strict_strtol(vec[0].c_str(), 10, &err);
+  long nsecs = 0;
+  if (!err.empty()) {
+    ldout(cct, 0) << "ERROR: failed converting mtime (" << s << ") to real_time " << dendl;
+    return -EINVAL;
+  }
+
+  if (vec.size() > 1) {
+    nsecs = strict_strtol(vec[1].c_str(), 10, &err);
+    if (!err.empty()) {
+      ldout(cct, 0) << "ERROR: failed converting mtime (" << s << ") to real_time " << dendl;
+      return -EINVAL;
+    }
+  }
+
+  *rt = utime_t(secs, nsecs).to_real_time();
+
+  return 0;
+}
+
+int RGWRESTStreamWriteRequest::complete(string& etag, real_time *mtime)
 {
   int ret = http_manager.complete_requests();
   if (ret < 0)
     return ret;
 
   set_str_from_headers(out_headers, "ETAG", etag);
+
   if (mtime) {
     string mtime_str;
     set_str_from_headers(out_headers, "RGWX_MTIME", mtime_str);
-    string err;
-    long t = strict_strtol(mtime_str.c_str(), 10, &err);
-    if (!err.empty()) {
-      ldout(cct, 0) << "ERROR: failed converting mtime (" << mtime_str << ") to int " << dendl;
-      return -EINVAL;
-    }
-    *mtime = (time_t)t;
-  }
 
+    ret = parse_rgwx_mtime(cct, mtime_str, mtime);
+    if (ret < 0) {
+      return ret;
+    }
+  }
   return status;
 }
 
@@ -581,7 +636,7 @@ int RGWRESTStreamRWRequest::get_resource(RGWAccessKey& key, map<string, string>&
   get_params_str(args, params_str);
 
   /* merge params with extra args so that we can sign correctly */
-  for (list<pair<string, string> >::iterator iter = params.begin(); iter != params.end(); ++iter) {
+  for (param_vec_t::iterator iter = params.begin(); iter != params.end(); ++iter) {
     new_info.args.append(iter->first, iter->second);
   }
 
@@ -639,20 +694,19 @@ int RGWRESTStreamRWRequest::get_resource(RGWAccessKey& key, map<string, string>&
   return 0;
 }
 
-int RGWRESTStreamRWRequest::complete(string& etag, time_t *mtime, map<string, string>& attrs)
+int RGWRESTStreamRWRequest::complete(string& etag, real_time *mtime, map<string, string>& attrs)
 {
   set_str_from_headers(out_headers, "ETAG", etag);
-  if (mtime) {
+  if (status >= 0 && mtime) {
     string mtime_str;
     set_str_from_headers(out_headers, "RGWX_MTIME", mtime_str);
     if (!mtime_str.empty()) {
-      string err;
-      long t = strict_strtol(mtime_str.c_str(), 10, &err);
-      if (!err.empty()) {
-        ldout(cct, 0) << "ERROR: failed converting mtime (" << mtime_str << ") to int " << dendl;
-        return -EINVAL;
+      int ret = parse_rgwx_mtime(cct, mtime_str, mtime);
+      if (ret < 0) {
+        return ret;
       }
-      *mtime = (time_t)t;
+    } else {
+      *mtime = real_time();
     }
   }
 

@@ -15,6 +15,7 @@
 #include "test/librados_test_stub/TestRadosClient.h"
 #include "test/librados_test_stub/TestMemRadosClient.h"
 #include "objclass/objclass.h"
+#include "osd/osd_types.h"
 #include <boost/bind.hpp>
 #include <boost/shared_ptr.hpp>
 #include <deque>
@@ -65,6 +66,16 @@ void do_out_buffer(string& outbl, char **outbuf, size_t *outbuflen) {
 }
 
 } // anonymous namespace
+
+namespace librados {
+
+MockTestMemIoCtxImpl &get_mock_io_ctx(IoCtx &ioctx) {
+  MockTestMemIoCtxImpl **mock =
+    reinterpret_cast<MockTestMemIoCtxImpl **>(&ioctx);
+  return **mock;
+}
+
+}
 
 namespace librados_test_stub {
 
@@ -538,8 +549,7 @@ int IoCtx::read(const std::string& oid, bufferlist& bl, size_t len,
 int IoCtx::remove(const std::string& oid) {
   TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
   return ctx->execute_operation(
-    oid, boost::bind(&TestIoCtxImpl::remove, _1, _2));
-  return ctx->remove(oid);
+    oid, boost::bind(&TestIoCtxImpl::remove, _1, _2, ctx->get_snap_context()));
 }
 
 int IoCtx::selfmanaged_snap_create(uint64_t *snapid) {
@@ -579,6 +589,13 @@ int IoCtx::tmap_update(const std::string& oid, bufferlist& cmdbl) {
   TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
   return ctx->execute_operation(
     oid, boost::bind(&TestIoCtxImpl::tmap_update, _1, _2, cmdbl));
+}
+
+int IoCtx::trunc(const std::string& oid, uint64_t off) {
+  TestIoCtxImpl *ctx = reinterpret_cast<TestIoCtxImpl*>(io_ctx_impl);
+  return ctx->execute_operation(
+    oid, boost::bind(&TestIoCtxImpl::truncate, _1, _2, off,
+                     ctx->get_snap_context()));
 }
 
 int IoCtx::unwatch2(uint64_t handle) {
@@ -751,7 +768,7 @@ void ObjectWriteOperation::omap_set(const std::map<std::string, bufferlist> &map
 
 void ObjectWriteOperation::remove() {
   TestObjectOperationImpl *o = reinterpret_cast<TestObjectOperationImpl*>(impl);
-  o->ops.push_back(boost::bind(&TestIoCtxImpl::remove, _1, _2));
+  o->ops.push_back(boost::bind(&TestIoCtxImpl::remove, _1, _2, _4));
 }
 
 void ObjectWriteOperation::selfmanaged_snap_rollback(uint64_t snapid) {
@@ -1102,6 +1119,11 @@ int cls_cxx_map_set_vals(cls_method_context_t hctx,
 
 int cls_cxx_read(cls_method_context_t hctx, int ofs, int len,
                  bufferlist *outbl) {
+  return cls_cxx_read2(hctx, ofs, len, outbl, 0);
+}
+
+int cls_cxx_read2(cls_method_context_t hctx, int ofs, int len,
+                  bufferlist *outbl, uint32_t op_flags) {
   librados::TestClassHandler::MethodContext *ctx =
     reinterpret_cast<librados::TestClassHandler::MethodContext*>(hctx);
   return ctx->io_ctx_impl->read(ctx->oid, len, ofs, outbl);
@@ -1122,6 +1144,11 @@ int cls_cxx_stat(cls_method_context_t hctx, uint64_t *size, time_t *mtime) {
 
 int cls_cxx_write(cls_method_context_t hctx, int ofs, int len,
                   bufferlist *inbl) {
+  return cls_cxx_write2(hctx, ofs, len, inbl, 0);
+}
+
+int cls_cxx_write2(cls_method_context_t hctx, int ofs, int len,
+                   bufferlist *inbl, uint32_t op_flags) {
   librados::TestClassHandler::MethodContext *ctx =
     reinterpret_cast<librados::TestClassHandler::MethodContext*>(hctx);
   return ctx->io_ctx_impl->write(ctx->oid, *inbl, len, ofs, ctx->snapc);
@@ -1131,6 +1158,33 @@ int cls_cxx_write_full(cls_method_context_t hctx, bufferlist *inbl) {
   librados::TestClassHandler::MethodContext *ctx =
     reinterpret_cast<librados::TestClassHandler::MethodContext*>(hctx);
   return ctx->io_ctx_impl->write_full(ctx->oid, *inbl, ctx->snapc);
+}
+
+int cls_cxx_list_watchers(cls_method_context_t hctx,
+			  obj_list_watch_response_t *watchers) {
+  librados::TestClassHandler::MethodContext *ctx =
+    reinterpret_cast<librados::TestClassHandler::MethodContext*>(hctx);
+
+  std::list<obj_watch_t> obj_watchers;
+  int r = ctx->io_ctx_impl->list_watchers(ctx->oid, &obj_watchers);
+  if (r < 0) {
+    return r;
+  }
+
+  for (auto &w : obj_watchers) {
+    watch_item_t watcher;
+    watcher.name = entity_name_t::CLIENT(w.watcher_id);
+    watcher.cookie = w.cookie;
+    watcher.timeout_seconds = w.timeout_seconds;
+    watcher.addr.parse(w.addr, 0);
+    watchers->entries.push_back(watcher);
+  }
+
+  return 0;
+}
+
+uint64_t cls_get_features(cls_method_context_t hctx) {
+  return CEPH_FEATURES_SUPPORTED_DEFAULT;
 }
 
 int cls_log(int level, const char *format, ...) {
@@ -1161,4 +1215,13 @@ int cls_register_cxx_method(cls_handle_t hclass, const char *method,
     cls_method_handle_t *handle) {
   librados::TestClassHandler *cls = get_class_handler();
   return cls->create_method(hclass, method, class_call, handle);
+}
+
+int cls_register_cxx_filter(cls_handle_t hclass,
+                            const std::string &filter_name,
+                            cls_cxx_filter_factory_t fn,
+                            cls_filter_handle_t *)
+{
+  librados::TestClassHandler *cls = get_class_handler();
+  return cls->create_filter(hclass, filter_name, fn);
 }

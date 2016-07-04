@@ -17,29 +17,14 @@
 #ifndef CEPH_REPLICATEDPG_H
 #define CEPH_REPLICATEDPG_H
 
-#include <boost/optional/optional_io.hpp>
 #include <boost/tuple/tuple.hpp>
-
 #include "include/assert.h" 
-#include "include/unordered_map.h"
-#include "common/cmdparse.h"
-
-#include "HitSet.h"
-#include "OSD.h"
 #include "PG.h"
 #include "Watch.h"
-#include "OpRequest.h"
 #include "TierAgentState.h"
-
-#include "messages/MOSDOp.h"
 #include "messages/MOSDOpReply.h"
-#include "messages/MOSDSubOp.h"
-
 #include "common/sharedptr_registry.hpp"
-
-#include "PGBackend.h"
 #include "ReplicatedBackend.h"
-#include "ECBackend.h"
 
 class MOSDSubOpReply;
 
@@ -48,6 +33,13 @@ class PromoteCallback;
 
 class ReplicatedPG;
 class PGLSFilter;
+class HitSet;
+struct TierAgentState;
+class MOSDOp;
+class MOSDOpReply;
+class MOSDSubOp;
+class OSDService;
+
 void intrusive_ptr_add_ref(ReplicatedPG *pg);
 void intrusive_ptr_release(ReplicatedPG *pg);
 uint64_t get_with_id(ReplicatedPG *pg);
@@ -257,7 +249,7 @@ public:
   typedef ceph::shared_ptr<FlushOp> FlushOpRef;
 
   boost::scoped_ptr<PGBackend> pgbackend;
-  PGBackend *get_pgbackend() {
+  PGBackend *get_pgbackend() override {
     return pgbackend.get();
   }
 
@@ -267,13 +259,13 @@ public:
     const ObjectRecoveryInfo &recovery_info,
     ObjectContextRef obc,
     ObjectStore::Transaction *t
-    );
+    ) override;
   void on_peer_recover(
     pg_shard_t peer,
     const hobject_t &oid,
     const ObjectRecoveryInfo &recovery_info,
     const object_stat_sum_t &stat
-    );
+    ) override;
   void begin_peer_recover(
     pg_shard_t peer,
     const hobject_t oid);
@@ -451,11 +443,6 @@ public:
     return get_sort_bitwise();
   }
 
-  bool transaction_use_tbl() {
-    uint64_t min_features = get_min_upacting_features();
-    return !(min_features & CEPH_FEATURE_OSD_TRANSACTION_MAY_LAYOUT);
-  }
-
   void send_message_osd_cluster(
     int peer, Message *m, epoch_t from_epoch);
   void send_message_osd_cluster(
@@ -568,19 +555,19 @@ public:
     list<std::function<void()>> on_success;
     template <typename F>
     void register_on_finish(F &&f) {
-      on_finish.emplace_back(std::move(f));
+      on_finish.emplace_back(std::forward<F>(f));
     }
     template <typename F>
     void register_on_success(F &&f) {
-      on_finish.emplace_back(std::move(f));
+      on_success.emplace_back(std::forward<F>(f));
     }
     template <typename F>
     void register_on_applied(F &&f) {
-      on_applied.emplace_back(std::move(f));
+      on_applied.emplace_back(std::forward<F>(f));
     }
     template <typename F>
     void register_on_commit(F &&f) {
-      on_committed.emplace_back(std::move(f));
+      on_committed.emplace_back(std::forward<F>(f));
     }
 
     bool sent_ack;
@@ -613,7 +600,7 @@ public:
     list<pair<boost::tuple<uint64_t, uint64_t, unsigned>,
 	      pair<bufferlist*, Context*> > > pending_async_reads;
     int async_read_result;
-    unsigned inflightreads;
+    int inflightreads;
     friend struct OnReadComplete;
     void start_async_reads(ReplicatedPG *pg);
     void finish_read(ReplicatedPG *pg);
@@ -686,6 +673,12 @@ public:
 	   pending_async_reads.erase(i++)) {
 	delete i->second.second;
       }
+    }
+    uint64_t get_features() {
+      if (op && op->get_req()) {
+        return op->get_req()->get_connection()->get_features();
+      }
+      return -1ll;
     }
   };
   using OpContextUPtr = std::unique_ptr<OpContext>;
@@ -847,7 +840,7 @@ protected:
       &requeue_recovery,
       &requeue_snaptrim);
     if (requeue_recovery)
-      osd->recovery_wq.queue(this);
+      queue_recovery();
     if (requeue_snaptrim)
       queue_snap_trim();
 
@@ -928,10 +921,6 @@ protected:
 
   // agent
   boost::scoped_ptr<TierAgentState> agent_state;
-
-  friend struct C_AgentFlushStartStop;
-  friend struct C_AgentEvictStartStop;
-  friend struct C_HitSetFlushing;
 
   void agent_setup();       ///< initialize agent state
   bool agent_work(int max) ///< entry point to do some agent work
@@ -1039,7 +1028,6 @@ protected:
 
   void get_src_oloc(const object_t& oid, const object_locator_t& oloc, object_locator_t& src_oloc);
 
-  SnapSetContext *create_snapset_context(const hobject_t& oid);
   SnapSetContext *get_snapset_context(
     const hobject_t& oid,
     bool can_create,
@@ -1249,18 +1237,19 @@ protected:
   void _clear_recovery_state();
 
   bool start_recovery_ops(
-    int max, ThreadPool::TPHandle &handle, int *started);
+    uint64_t max,
+    ThreadPool::TPHandle &handle, uint64_t *started);
 
-  int recover_primary(int max, ThreadPool::TPHandle &handle);
-  int recover_replicas(int max, ThreadPool::TPHandle &handle);
+  uint64_t recover_primary(uint64_t max, ThreadPool::TPHandle &handle);
+  uint64_t recover_replicas(uint64_t max, ThreadPool::TPHandle &handle);
   hobject_t earliest_peer_backfill() const;
   bool all_peer_done() const;
   /**
    * @param work_started will be set to true if recover_backfill got anywhere
    * @returns the number of operations started
    */
-  int recover_backfill(int max, ThreadPool::TPHandle &handle,
-                       bool *work_started);
+  uint64_t recover_backfill(uint64_t max, ThreadPool::TPHandle &handle,
+			    bool *work_started);
 
   /**
    * scan a (hash) range of objects in the current pg
@@ -1300,14 +1289,6 @@ protected:
 	obc2->ondisk_write_unlock();
       if (obc3)
 	obc3->ondisk_write_unlock();
-    }
-  };
-  struct C_OSD_OndiskWriteUnlockList : public Context {
-    list<ObjectContextRef> *pls;
-    explicit C_OSD_OndiskWriteUnlockList(list<ObjectContextRef> *l) : pls(l) {}
-    void finish(int r) {
-      for (list<ObjectContextRef>::iterator p = pls->begin(); p != pls->end(); ++p)
-	(*p)->ondisk_write_unlock();
     }
   };
   struct C_OSD_AppliedRecoveredObject : public Context {
@@ -1421,7 +1402,6 @@ protected:
   virtual void _scrub_clear_state();
   virtual void _scrub_finish();
   object_stat_collection_t scrub_cstat;
-  friend class C_ScrubDigestUpdated;
 
   virtual void _split_into(pg_t child_pgid, PG *child, unsigned split_bits);
   void apply_and_flush_repops(bool requeue);
@@ -1429,6 +1409,8 @@ protected:
   void calc_trim_to();
   int do_xattr_cmp_u64(int op, __u64 v1, bufferlist& xattr);
   int do_xattr_cmp_str(int op, string& v1s, bufferlist& xattr);
+
+  int do_writesame(OpContext *ctx, OSDOp& osd_op);
 
   bool pgls_filter(PGLSFilter *filter, hobject_t& sobj, bufferlist& outdata);
   int get_pgls_filter(bufferlist::iterator& iter, PGLSFilter **pfilter);
@@ -1453,7 +1435,6 @@ protected:
   void finish_proxy_write(hobject_t oid, ceph_tid_t tid, int r);
   void cancel_proxy_write(ProxyWriteOpRef pwop);
 
-  friend struct C_ProxyWrite_Apply;
   friend struct C_ProxyWrite_Commit;
 
 public:
@@ -1678,7 +1659,7 @@ public:
     bool user_only = false);
 };
 
-inline ostream& operator<<(ostream& out, ReplicatedPG::RepGather& repop)
+inline ostream& operator<<(ostream& out, const ReplicatedPG::RepGather& repop)
 {
   out << "repgather(" << &repop
       << " " << repop.v
@@ -1689,7 +1670,8 @@ inline ostream& operator<<(ostream& out, ReplicatedPG::RepGather& repop)
   return out;
 }
 
-inline ostream& operator<<(ostream& out, ReplicatedPG::ProxyWriteOpRef pwop)
+inline ostream& operator<<(ostream& out,
+			   const ReplicatedPG::ProxyWriteOpRef& pwop)
 {
   out << "proxywrite(" << &pwop
       << " " << pwop->user_version

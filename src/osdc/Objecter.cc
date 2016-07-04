@@ -85,6 +85,7 @@ enum {
   l_osdc_osdop_read,
   l_osdc_osdop_write,
   l_osdc_osdop_writefull,
+  l_osdc_osdop_writesame,
   l_osdc_osdop_append,
   l_osdc_osdop_zero,
   l_osdc_osdop_truncate,
@@ -153,6 +154,40 @@ static const char *config_keys[] = {
   NULL
 };
 
+/**
+ * This is a more limited form of C_Contexts, but that requires
+ * a ceph_context which we don't have here.
+ */
+class ObjectOperation::C_TwoContexts : public Context {
+  Context *first;
+  Context *second;
+public:
+  C_TwoContexts(Context *first, Context *second) :
+    first(first), second(second) {}
+  void finish(int r) {
+    first->complete(r);
+    second->complete(r);
+    first = NULL;
+    second = NULL;
+  }
+
+  virtual ~C_TwoContexts() {
+    delete first;
+    delete second;
+  }
+};
+
+void ObjectOperation::add_handler(Context *extra) {
+  size_t last = out_handler.size() - 1;
+  Context *orig = out_handler[last];
+  if (orig) {
+    Context *wrapper = new C_TwoContexts(orig, extra);
+    out_handler[last] = wrapper;
+  } else {
+    out_handler[last] = extra;
+  }
+}
+
 Objecter::OSDSession::unique_completion_lock Objecter::OSDSession::get_lock(
   object_t& oid)
 {
@@ -184,16 +219,7 @@ void Objecter::handle_conf_change(const struct md_config_t *conf,
 void Objecter::update_crush_location()
 {
   unique_lock wl(rwlock);
-  std::multimap<string,string> new_crush_location;
-  vector<string> lvec;
-  get_str_vec(cct->_conf->crush_location, ";, \t", lvec);
-  int r = CrushWrapper::parse_loc_multimap(lvec, &new_crush_location);
-  if (r < 0) {
-    lderr(cct) << "warning: crush_location '" << cct->_conf->crush_location
-	       << "' does not parse, leave origin crush_location untouched." << dendl;
-    return;
-  }
-  crush_location = new_crush_location;
+  crush_location = cct->crush_location.get_location();
 }
 
 // messages ------------------------------
@@ -233,6 +259,8 @@ void Objecter::init()
     pcb.add_u64_counter(l_osdc_osdop_write, "osdop_write", "Write operations");
     pcb.add_u64_counter(l_osdc_osdop_writefull, "osdop_writefull",
 			"Write full object operations");
+    pcb.add_u64_counter(l_osdc_osdop_writesame, "osdop_writesame",
+                        "Write same operations");
     pcb.add_u64_counter(l_osdc_osdop_append, "osdop_append",
 			"Append operation");
     pcb.add_u64_counter(l_osdc_osdop_zero, "osdop_zero",
@@ -542,10 +570,10 @@ void Objecter::_send_linger(LingerOp *info,
     }
     sl.unlock();
 
-    info->register_tid = _op_submit(o, sul);
+    _op_submit(o, sul, &info->register_tid);
   } else {
     // first send
-    info->register_tid = _op_submit_with_budget(o, sul);
+    _op_submit_with_budget(o, sul, &info->register_tid);
   }
 
   logger->inc(l_osdc_linger_send);
@@ -706,7 +734,9 @@ int Objecter::linger_check(LingerOp *info)
 		 << " age " << age << dendl;
   if (info->last_error)
     return info->last_error;
-  return std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
+  // return a safe upper bound (we are truncating to ms)
+  return
+    1 + std::chrono::duration_cast<std::chrono::milliseconds>(age).count();
 }
 
 void Objecter::linger_cancel(LingerOp *info)
@@ -2125,14 +2155,18 @@ void Objecter::resend_mon_ops()
 
 // read | write ---------------------------
 
-ceph_tid_t Objecter::op_submit(Op *op, int *ctx_budget)
+void Objecter::op_submit(Op *op, ceph_tid_t *ptid, int *ctx_budget)
 {
   shunique_lock rl(rwlock, ceph::acquire_shared);
-  return _op_submit_with_budget(op, rl, ctx_budget);
+  ceph_tid_t tid = 0;
+  if (!ptid)
+    ptid = &tid;
+  _op_submit_with_budget(op, rl, ptid, ctx_budget);
 }
 
-ceph_tid_t Objecter::_op_submit_with_budget(Op *op, shunique_lock& sul,
-					    int *ctx_budget)
+void Objecter::_op_submit_with_budget(Op *op, shunique_lock& sul,
+				      ceph_tid_t *ptid,
+				      int *ctx_budget)
 {
   assert(initialized.read());
 
@@ -2160,7 +2194,7 @@ ceph_tid_t Objecter::_op_submit_with_budget(Op *op, shunique_lock& sul,
 				      op_cancel(tid, -ETIMEDOUT); });
   }
 
-  return _op_submit(op, sul);
+  _op_submit(op, sul, ptid);
 }
 
 void Objecter::_send_op_account(Op *op)
@@ -2201,6 +2235,7 @@ void Objecter::_send_op_account(Op *op)
     case CEPH_OSD_OP_READ: code = l_osdc_osdop_read; break;
     case CEPH_OSD_OP_WRITE: code = l_osdc_osdop_write; break;
     case CEPH_OSD_OP_WRITEFULL: code = l_osdc_osdop_writefull; break;
+    case CEPH_OSD_OP_WRITESAME: code = l_osdc_osdop_writesame; break;
     case CEPH_OSD_OP_APPEND: code = l_osdc_osdop_append; break;
     case CEPH_OSD_OP_ZERO: code = l_osdc_osdop_zero; break;
     case CEPH_OSD_OP_TRUNCATE: code = l_osdc_osdop_truncate; break;
@@ -2242,7 +2277,7 @@ void Objecter::_send_op_account(Op *op)
   }
 }
 
-ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
+void Objecter::_op_submit(Op *op, shunique_lock& sul, ceph_tid_t *ptid)
 {
   // rwlock is locked
 
@@ -2276,11 +2311,6 @@ ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
   _send_op_account(op);
 
   // send?
-  ldout(cct, 10) << "_op_submit oid " << op->target.base_oid
-		 << " '" << op->target.base_oloc << "' '"
-		 << op->target.target_oloc << "' " << op->ops << " tid "
-		 << op->tid << " osd." << (!s->is_homeless() ? s->osd : -1)
-		 << dendl;
 
   assert(op->target.flags & (CEPH_OSD_FLAG_READ|CEPH_OSD_FLAG_WRITE));
 
@@ -2298,7 +2328,7 @@ ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
 		   << dendl;
     op->target.paused = true;
     _maybe_request_map();
-  } else if ((op->target.flags & CEPH_OSD_FLAG_WRITE) &&
+  } else if ((op->target.flags & (CEPH_OSD_FLAG_WRITE | CEPH_OSD_FLAG_RWORDERED)) &&
 	     !(op->target.flags & (CEPH_OSD_FLAG_FULL_TRY |
 				   CEPH_OSD_FLAG_FULL_FORCE)) &&
 	     (_osdmap_full_flag() ||
@@ -2321,6 +2351,13 @@ ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
   OSDSession::unique_lock sl(s->lock);
   if (op->tid == 0)
     op->tid = last_tid.inc();
+
+  ldout(cct, 10) << "_op_submit oid " << op->target.base_oid
+		 << " '" << op->target.base_oloc << "' '"
+		 << op->target.target_oloc << "' " << op->ops << " tid "
+		 << op->tid << " osd." << (!s->is_homeless() ? s->osd : -1)
+		 << dendl;
+
   _session_op_assign(s, op);
 
   if (need_send) {
@@ -2333,6 +2370,8 @@ ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
   if (check_for_latest_map) {
     _send_op_map_check(op);
   }
+  if (ptid)
+    *ptid = tid;
   op = NULL;
 
   sl.unlock();
@@ -2340,8 +2379,6 @@ ceph_tid_t Objecter::_op_submit(Op *op, shunique_lock& sul)
 
   ldout(cct, 5) << num_unacked.read() << " unacked, " << num_uncommitted.read()
 		<< " uncommitted" << dendl;
-
-  return tid;
 }
 
 int Objecter::op_cancel(OSDSession *s, ceph_tid_t tid, int r)
@@ -2661,7 +2698,15 @@ int Objecter::_calc_target(op_target_t *t, epoch_t *last_force_resend,
       t->osd = -1;
       return RECALC_OP_TARGET_POOL_DNE;
     }
-    pgid = osdmap->raw_pg_to_pg(t->base_pgid);
+    if (osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE)) {
+      // if the SORTBITWISE flag is set, we know all OSDs are running
+      // jewel+.
+      pgid = t->base_pgid;
+    } else {
+      // legacy behavior.  pre-jewel OSDs will fail if we send a
+      // full-hash pgid value.
+      pgid = osdmap->raw_pg_to_pg(t->base_pgid);
+    }
   } else {
     int ret = osdmap->object_locator_to_pg(t->target_oid, t->target_oloc,
 					   pgid);
@@ -3209,7 +3254,7 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
     m->get_redirect().combine_with_locator(op->target.target_oloc,
 					   op->target.target_oid.name);
     op->target.flags |= CEPH_OSD_FLAG_REDIRECTED;
-    _op_submit(op, sul);
+    _op_submit(op, sul, NULL);
     m->put();
     return;
   }
@@ -3305,9 +3350,7 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
   }
 
   /* get it before we call _finish_op() */
-  auto completion_lock =
-    (op->target.base_oid.name.size() ? s->get_lock(op->target.base_oid) :
-     OSDSession::unique_completion_lock());
+  auto completion_lock = s->get_lock(op->target.base_oid);
 
   // done with this tid?
   if (!op->onack && !op->oncommit && !op->oncommit_sync) {
@@ -3396,19 +3439,19 @@ void Objecter::list_nobjects(NListContext *list_context, Context *onfinish)
     return;
   }
   int pg_num = pool->get_pg_num();
+  bool sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
   rl.unlock();
 
   if (list_context->starting_pg_num == 0) {     // there can't be zero pgs!
     list_context->starting_pg_num = pg_num;
-    list_context->sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
+    list_context->sort_bitwise = sort_bitwise;
     ldout(cct, 20) << pg_num << " placement groups" << dendl;
   }
-  if (list_context->sort_bitwise !=
-      osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE)) {
+  if (list_context->sort_bitwise != sort_bitwise) {
     ldout(cct, 10) << " hobject sort order changed, restarting this pg"
 		   << dendl;
     list_context->cookie = collection_list_handle_t();
-    list_context->sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
+    list_context->sort_bitwise = sort_bitwise;
   }
   if (list_context->starting_pg_num != pg_num) {
     // start reading from the beginning; the pgs have changed
@@ -3552,19 +3595,19 @@ void Objecter::list_objects(ListContext *list_context, Context *onfinish)
     return;
   }
   int pg_num = pool->get_pg_num();
+  bool sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
   rl.unlock();
 
   if (list_context->starting_pg_num == 0) {     // there can't be zero pgs!
     list_context->starting_pg_num = pg_num;
-    list_context->sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
+    list_context->sort_bitwise = sort_bitwise;
     ldout(cct, 20) << pg_num << " placement groups" << dendl;
   }
-  if (list_context->sort_bitwise !=
-      osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE)) {
+  if (list_context->sort_bitwise != sort_bitwise) {
     ldout(cct, 10) << " hobject sort order changed, restarting this pg"
 		   << dendl;
     list_context->cookie = collection_list_handle_t();
-    list_context->sort_bitwise = osdmap->test_flag(CEPH_OSDMAP_SORTBITWISE);
+    list_context->sort_bitwise = sort_bitwise;
   }
   if (list_context->starting_pg_num != pg_num) {
     // start reading from the beginning; the pgs have changed

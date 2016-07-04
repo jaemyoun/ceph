@@ -70,6 +70,8 @@ check_SCRIPTS += \
 	test/cephtool-test-mon.sh \
 	test/cephtool-test-mds.sh \
 	test/cephtool-test-rados.sh \
+       test/test_pool_create.sh \
+       test/test_crush_bucket.sh \
 	unittest_bufferlist.sh \
 	test/encoding/check-generated.sh \
 	test/mon/osd-pool-create.sh \
@@ -80,7 +82,7 @@ check_SCRIPTS += \
 	test/mon/osd-erasure-code-profile.sh \
 	test/mon/mkfs.sh \
 	test/mon/mon-scrub.sh \
-	test/osd/osd-scrub-repair.sh \
+       test/mon/test_pool_quota.sh \
 	test/osd/osd-scrub-snaps.sh \
 	test/osd/osd-config.sh \
 	test/osd/osd-reuse-id.sh \
@@ -139,6 +141,11 @@ UNITTEST_LDADD = \
 if SOLARIS
 UNITTEST_LDADD += \
 	-lsocket -lnsl
+endif
+
+if FREEBSD
+UNITTEST_LDADD += \
+      -lexecinfo
 endif
 
 unittest_addrs_SOURCES = test/test_addrs.cc
@@ -445,12 +452,29 @@ unittest_async_compressor_CXXFLAGS = $(UNITTEST_CXXFLAGS)
 unittest_async_compressor_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) $(LIBCOMPRESSOR) $(LIBCOMMON)
 check_PROGRAMS += unittest_async_compressor
 
+unittest_dns_resolve_SOURCES = test/common/dns_resolve.cc
+unittest_dns_resolve_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) $(RESOLV_LIBS)
+unittest_dns_resolve_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+check_TESTPROGRAMS += unittest_dns_resolve
+
+unittest_monmap_SOURCES = test/mon/MonMap.cc
+unittest_monmap_LDADD = $(UNITTEST_LDADD) $(CEPH_GLOBAL) $(RESOLV_LIBS)
+unittest_monmap_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+check_TESTPROGRAMS += unittest_monmap
+
+if LINUX
+#
+# XXX FREEBSD
+# These tests use nosetests and getting that to work thusfar has not worked
+#
 check_SCRIPTS += test/pybind/test_ceph_argparse.py
 check_SCRIPTS += test/pybind/test_ceph_daemon.py
+endif
 
 ceph_test_objectcacher_stress_SOURCES = \
 	test/osdc/object_cacher_stress.cc \
-	test/osdc/FakeWriteback.cc
+	test/osdc/FakeWriteback.cc \
+	test/osdc/MemWriteback.cc
 ceph_test_objectcacher_stress_LDADD = $(LIBOSDC) $(CEPH_GLOBAL)
 bin_DEBUGPROGRAMS += ceph_test_objectcacher_stress
 
@@ -487,6 +511,7 @@ noinst_HEADERS += \
 	test/ObjectMap/KeyValueDBMemory.h \
 	test/omap_bench.h \
 	test/osdc/FakeWriteback.h \
+	test/osdc/MemWriteback.h \
 	test/osd/Object.h \
 	test/osd/RadosModel.h \
 	test/osd/TestOpStat.h \

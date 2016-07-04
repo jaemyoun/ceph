@@ -47,9 +47,6 @@ class Session;
 class MMDSResolve;
 class MMDSResolveAck;
 class MMDSCacheRejoin;
-class MMDSCacheRejoinAck;
-class MJoin;
-class MJoinAck;
 class MDiscover;
 class MDiscoverReply;
 class MCacheExpire;
@@ -154,6 +151,10 @@ public:
   void notify_stray(CDentry *dn) {
     assert(dn->get_dir()->get_inode()->is_stray());
     stray_manager.eval_stray(dn);
+  }
+
+  void notify_stray_loaded(CDentry *dn) {
+    stray_manager.notify_stray_loaded(dn);
   }
 
   void handle_conf_change(const struct md_config_t *conf,
@@ -825,6 +826,7 @@ public:
                                   version_t dpv, MDSInternalContextBase *fin);
 
   void open_foreign_mdsdir(inodeno_t ino, MDSInternalContextBase *c);
+  CDir *get_stray_dir(CInode *in);
   CDentry *get_or_create_stray_dentry(CInode *in);
 
   MDSInternalContextBase *_get_waiter(MDRequestRef& mdr, Message *req, MDSInternalContextBase *fin);

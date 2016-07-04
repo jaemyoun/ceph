@@ -1206,7 +1206,10 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
       client->fsync(fd, b);
     } else if (strcmp(op, "chdir") == 0) {
       const char *a = t.get_string(buf, p);
-      client->chdir(a);
+      // Client users should remember their path, but since this
+      // is just a synthetic client we ignore it.
+      std::string ignore;
+      client->chdir(a, ignore);
     } else if (strcmp(op, "statfs") == 0) {
       struct statvfs stbuf;
       client->statfs("/", &stbuf);
@@ -1699,6 +1702,7 @@ int SyntheticClient::dump_placement(string& fn) {
   int lstat_result = client->lstat(fn.c_str(), &stbuf);
   if (lstat_result < 0) {
     dout(0) << "lstat error for file " << fn << dendl;
+    client->close(fd);
     return lstat_result;
   }
     
@@ -3321,10 +3325,15 @@ int SyntheticClient::lookup_ino(inodeno_t ino)
 int SyntheticClient::chunk_file(string &filename)
 {
   int fd = client->open(filename.c_str(), O_RDONLY);
-  int ret;
+  if (fd < 0)
+    return fd;
 
   struct stat st;
-  client->fstat(fd, &st);
+  int ret = client->fstat(fd, &st);
+  if (ret < 0) {
+    client->close(fd);
+    return ret;
+  }
   uint64_t size = st.st_size;
   dout(0) << "file " << filename << " size is " << size << dendl;
 
@@ -3334,8 +3343,7 @@ int SyntheticClient::chunk_file(string &filename)
   memset(&inode, 0, sizeof(inode));
   inode.ino = st.st_ino;
   ret = client->fdescribe_layout(fd, &inode.layout);
-  if (ret < 0)
-    return ret;
+  assert(ret == 0); // otherwise fstat did a bad thing
 
   uint64_t pos = 0;
   bufferlist from_before;

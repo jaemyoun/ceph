@@ -84,6 +84,8 @@ const char *ceph_osd_op_flag_name(unsigned flag);
 string ceph_osd_flag_string(unsigned flags);
 /// conver CEPH_OSD_OP_FLAG_* op flags to a string
 string ceph_osd_op_flag_string(unsigned flags);
+/// conver CEPH_OSD_ALLOC_HINT_FLAG_* op flags to a string
+string ceph_osd_alloc_hint_flag_string(unsigned flags);
 
 struct pg_shard_t {
   int32_t osd;
@@ -277,7 +279,7 @@ enum {
 
 // pg stuff
 
-#define OSD_SUPERBLOCK_POBJECT ghobject_t(hobject_t(sobject_t(object_t("osd_superblock"), 0)))
+#define OSD_SUPERBLOCK_GOBJECT ghobject_t(hobject_t(sobject_t(object_t("osd_superblock"), 0)))
 
 // placement seed (a hash value)
 typedef uint32_t ps_t;
@@ -497,10 +499,23 @@ struct spg_t {
     DECODE_FINISH(bl);
   }
 
-  hobject_t make_temp_object(const string& name) const {
+  hobject_t make_temp_hobject(const string& name) const {
     return hobject_t(object_t(name), "", CEPH_NOSNAP,
 		     pgid.ps(),
 		     hobject_t::POOL_TEMP_START - pgid.pool(), "");
+  }
+
+  ghobject_t make_temp_ghobject(const string& name) const {
+    return ghobject_t(
+      hobject_t(object_t(name), "", CEPH_NOSNAP,
+		pgid.ps(),
+		hobject_t::POOL_TEMP_START - pgid.pool(), ""),
+      ghobject_t::NO_GEN,
+      shard);
+  }
+
+  unsigned hash_to_shard(unsigned num_shards) const {
+    return ps() % num_shards;
   }
 };
 WRITE_CLASS_ENCODER(spg_t)
@@ -659,6 +674,12 @@ public:
       break;
     }
     return o;
+  }
+
+  unsigned hash_to_shard(unsigned num_shards) const {
+    if (type == TYPE_PG)
+      return pgid.hash_to_shard(num_shards);
+    return 0;  // whatever.
   }
 
   void dump(Formatter *f) const;
@@ -896,7 +917,7 @@ inline ostream& operator<<(ostream& out, const osd_stat_t& s) {
 //#define PG_STATE_STRAY      (1<<6)  // i must notify the primary i exist.
 #define PG_STATE_SPLITTING    (1<<7)  // i am splitting
 #define PG_STATE_SCRUBBING    (1<<8)  // scrubbing
-#define PG_STATE_SCRUBQ       (1<<9)  // queued for scrub
+//#define PG_STATE_SCRUBQ       (1<<9)  // queued for scrub
 #define PG_STATE_DEGRADED     (1<<10) // pg contains objects with reduced redundancy
 #define PG_STATE_INCONSISTENT (1<<11) // pg replicas are inconsistent (but shouldn't be)
 #define PG_STATE_PEERING      (1<<12) // pg is (re)peering
@@ -954,7 +975,8 @@ public:
     SCRUB_MAX_INTERVAL,
     DEEP_SCRUB_INTERVAL,
     RECOVERY_PRIORITY,
-    RECOVERY_OP_PRIORITY
+    RECOVERY_OP_PRIORITY,
+    SCRUB_PRIORITY
   };
 
   enum type_t {
@@ -1116,7 +1138,8 @@ struct pg_pool_t {
     CACHEMODE_FORWARD = 2,               ///< forward if not in cache
     CACHEMODE_READONLY = 3,              ///< handle reads, forward writes [not strongly consistent]
     CACHEMODE_READFORWARD = 4,           ///< forward reads, write to cache flush later
-    CACHEMODE_READPROXY = 5              ///< proxy reads, write to cache flush later
+    CACHEMODE_READPROXY = 5,             ///< proxy reads, write to cache flush later
+    CACHEMODE_PROXY = 6,                 ///< proxy if not in cache
   } cache_mode_t;
   static const char *get_cache_mode_name(cache_mode_t m) {
     switch (m) {
@@ -1126,6 +1149,7 @@ struct pg_pool_t {
     case CACHEMODE_READONLY: return "readonly";
     case CACHEMODE_READFORWARD: return "readforward";
     case CACHEMODE_READPROXY: return "readproxy";
+    case CACHEMODE_PROXY: return "proxy";
     default: return "unknown";
     }
   }
@@ -1142,6 +1166,8 @@ struct pg_pool_t {
       return CACHEMODE_READFORWARD;
     if (s == "readproxy")
       return CACHEMODE_READPROXY;
+    if (s == "proxy")
+      return CACHEMODE_PROXY;
     return (cache_mode_t)-1;
   }
   const char *get_cache_mode_name() const {
@@ -1152,6 +1178,7 @@ struct pg_pool_t {
     case CACHEMODE_NONE:
     case CACHEMODE_FORWARD:
     case CACHEMODE_READONLY:
+    case CACHEMODE_PROXY:
       return false;
     case CACHEMODE_WRITEBACK:
     case CACHEMODE_READFORWARD:
@@ -1413,7 +1440,6 @@ public:
     return quota_max_objects;
   }
 
-  static int calc_bits_of(int t);
   void calc_pg_masks();
 
   /*
@@ -2649,42 +2675,6 @@ struct pg_log_t {
     return head.version - tail.version;
   }
 
-  list<pg_log_entry_t>::const_iterator find_entry(eversion_t v) const {
-    int fromhead = head.version - v.version;
-    int fromtail = v.version - tail.version;
-    list<pg_log_entry_t>::const_iterator p;
-    if (fromhead < fromtail) {
-      p = log.end();
-      --p;
-      while (p->version > v)
-	--p;
-      return p;
-    } else {
-      p = log.begin();
-      while (p->version < v)
-	++p;
-      return p;
-    }      
-  }
-
-  list<pg_log_entry_t>::iterator find_entry(eversion_t v) {
-    int fromhead = head.version - v.version;
-    int fromtail = v.version - tail.version;
-    list<pg_log_entry_t>::iterator p;
-    if (fromhead < fromtail) {
-      p = log.end();
-      --p;
-      while (p->version > v)
-	--p;
-      return p;
-    } else {
-      p = log.begin();
-      while (p->version < v)
-	++p;
-      return p;
-    }      
-  }
-
   static void filter_log(spg_t import_pgid, const OSDMap &curmap,
     const string &hit_set_namespace, const pg_log_t &in,
     pg_log_t &out, pg_log_t &reject);
@@ -2710,7 +2700,7 @@ struct pg_log_t {
    * copy up to N entries
    *
    * @param other source log
-   * @param max max number of entreis to copy
+   * @param max max number of entries to copy
    */
   void copy_up_to(const pg_log_t &other, int max);
 
@@ -3041,6 +3031,25 @@ ostream& operator<<(ostream& out, const osd_peer_stat_t &stat);
 // -----------------------------------------
 
 class ObjectExtent {
+  /**
+   * ObjectExtents are used for specifying IO behavior against RADOS
+   * objects when one is using the ObjectCacher.
+   *
+   * To use this in a real system, *every member* must be filled
+   * out correctly. In particular, make sure to initialize the
+   * oloc correctly, as its default values are deliberate poison
+   * and will cause internal ObjectCacher asserts.
+   *
+   * Similarly, your buffer_extents vector *must* specify a total
+   * size equal to your length. If the buffer_extents inadvertently
+   * contain less space than the length member specifies, you
+   * will get unintelligible asserts deep in the ObjectCacher.
+   *
+   * If you are trying to do testing and don't care about actual
+   * RADOS function, the simplest thing to do is to initialize
+   * the ObjectExtent (truncate_size can be 0), create a single entry
+   * in buffer_extents matching the length, and set oloc.pool to 0.
+   */
  public:
   object_t    oid;       // object id
   uint64_t    objectno;
@@ -3192,12 +3201,12 @@ struct watch_info_t {
   watch_info_t() : cookie(0), timeout_seconds(0) { }
   watch_info_t(uint64_t c, uint32_t t, const entity_addr_t& a) : cookie(c), timeout_seconds(t), addr(a) {}
 
-  void encode(bufferlist& bl) const;
+  void encode(bufferlist& bl, uint64_t features) const;
   void decode(bufferlist::iterator& bl);
   void dump(Formatter *f) const;
   static void generate_test_instances(list<watch_info_t*>& o);
 };
-WRITE_CLASS_ENCODER(watch_info_t)
+WRITE_CLASS_ENCODER_FEATURES(watch_info_t)
 
 static inline bool operator==(const watch_info_t& l, const watch_info_t& r) {
   return l.cookie == r.cookie && l.timeout_seconds == r.timeout_seconds
@@ -3342,7 +3351,7 @@ struct object_info_t {
     set_omap_digest(-1);
   }
 
-  void encode(bufferlist& bl) const;
+  void encode(bufferlist& bl, uint64_t features) const;
   void decode(bufferlist::iterator& bl);
   void decode(bufferlist& bl) {
     bufferlist::iterator p = bl.begin();
@@ -3372,7 +3381,7 @@ struct object_info_t {
     return *this;
   }
 };
-WRITE_CLASS_ENCODER(object_info_t)
+WRITE_CLASS_ENCODER_FEATURES(object_info_t)
 
 struct ObjectState {
   object_info_t oi;
@@ -3900,12 +3909,12 @@ struct ObjectRecoveryInfo {
   ObjectRecoveryInfo() : size(0) { }
 
   static void generate_test_instances(list<ObjectRecoveryInfo*>& o);
-  void encode(bufferlist &bl) const;
+  void encode(bufferlist &bl, uint64_t features) const;
   void decode(bufferlist::iterator &bl, int64_t pool = -1);
   ostream &print(ostream &out) const;
   void dump(Formatter *f) const;
 };
-WRITE_CLASS_ENCODER(ObjectRecoveryInfo)
+WRITE_CLASS_ENCODER_FEATURES(ObjectRecoveryInfo)
 ostream& operator<<(ostream& out, const ObjectRecoveryInfo &inf);
 
 struct ObjectRecoveryProgress {
@@ -3957,14 +3966,14 @@ struct PullOp {
   ObjectRecoveryProgress recovery_progress;
 
   static void generate_test_instances(list<PullOp*>& o);
-  void encode(bufferlist &bl) const;
+  void encode(bufferlist &bl, uint64_t features) const;
   void decode(bufferlist::iterator &bl);
   ostream &print(ostream &out) const;
   void dump(Formatter *f) const;
 
   uint64_t cost(CephContext *cct) const;
 };
-WRITE_CLASS_ENCODER(PullOp)
+WRITE_CLASS_ENCODER_FEATURES(PullOp)
 ostream& operator<<(ostream& out, const PullOp &op);
 
 struct PushOp {
@@ -3981,14 +3990,14 @@ struct PushOp {
   ObjectRecoveryProgress after_progress;
 
   static void generate_test_instances(list<PushOp*>& o);
-  void encode(bufferlist &bl) const;
+  void encode(bufferlist &bl, uint64_t features) const;
   void decode(bufferlist::iterator &bl);
   ostream &print(ostream &out) const;
   void dump(Formatter *f) const;
 
   uint64_t cost(CephContext *cct) const;
 };
-WRITE_CLASS_ENCODER(PushOp)
+WRITE_CLASS_ENCODER_FEATURES(PushOp)
 ostream& operator<<(ostream& out, const PushOp &op);
 
 
@@ -4098,12 +4107,12 @@ struct watch_item_t {
     : name(name), cookie(cookie), timeout_seconds(timeout),
     addr(addr) { }
 
-  void encode(bufferlist &bl) const {
+  void encode(bufferlist &bl, uint64_t features) const {
     ENCODE_START(2, 1, bl);
     ::encode(name, bl);
     ::encode(cookie, bl);
     ::encode(timeout_seconds, bl);
-    ::encode(addr, bl);
+    ::encode(addr, bl, features);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator &bl) {
@@ -4117,7 +4126,7 @@ struct watch_item_t {
     DECODE_FINISH(bl);
   }
 };
-WRITE_CLASS_ENCODER(watch_item_t)
+WRITE_CLASS_ENCODER_FEATURES(watch_item_t)
 
 struct obj_watch_item_t {
   hobject_t obj;
@@ -4131,9 +4140,9 @@ struct obj_watch_item_t {
 struct obj_list_watch_response_t {
   list<watch_item_t> entries;
 
-  void encode(bufferlist& bl) const {
+  void encode(bufferlist& bl, uint64_t features) const {
     ENCODE_START(1, 1, bl);
-    ::encode(entries, bl);
+    ::encode(entries, bl, features);
     ENCODE_FINISH(bl);
   }
   void decode(bufferlist::iterator& bl) {
@@ -4173,8 +4182,7 @@ struct obj_list_watch_response_t {
     o.back()->entries.push_back(watch_item_t(entity_name_t(entity_name_t::TYPE_CLIENT, 2), 20, 60, ea));
   }
 };
-
-WRITE_CLASS_ENCODER(obj_list_watch_response_t)
+WRITE_CLASS_ENCODER_FEATURES(obj_list_watch_response_t)
 
 struct clone_info {
   snapid_t cloneid;
@@ -4321,5 +4329,27 @@ struct PromoteCounter {
     bytes.set(*b / 2);
   }
 };
+
+/** store_statfs_t
++* ObjectStore full statfs information
++*/
+struct store_statfs_t
+{
+  uint64_t total = 0;                  // Total bytes
+  uint64_t available = 0;              // Free bytes available
+
+  int64_t allocated = 0;               // Bytes allocated by the store
+  int64_t stored = 0;                  // Bytes actually stored by the user
+  int64_t compressed = 0;              // Bytes stored after compression
+  int64_t compressed_allocated = 0;    // Bytes allocated for compressed data
+  int64_t compressed_original = 0;     // Bytes that were successfully compressed
+
+  void reset() {
+    *this = store_statfs_t();
+  }
+  bool operator ==(const store_statfs_t& other) const;
+  void dump(Formatter *f) const;
+};
+ostream &operator<<(ostream &lhs, const store_statfs_t &rhs);
 
 #endif

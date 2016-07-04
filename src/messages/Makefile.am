@@ -49,6 +49,7 @@ noinst_HEADERS += \
 	messages/MMDSFragmentNotify.h \
 	messages/MMDSMap.h \
 	messages/MFSMap.h \
+	messages/MFSMapUser.h \
 	messages/MMDSOpenIno.h \
 	messages/MMDSOpenInoReply.h \
 	messages/MMDSResolve.h \
@@ -123,5 +124,6 @@ noinst_HEADERS += \
 	messages/MStatfsReply.h \
 	messages/MTimeCheck.h \
 	messages/MWatchNotify.h \
-	messages/PaxosServiceMessage.h
+	messages/PaxosServiceMessage.h \
+	messages/MNop.h
 

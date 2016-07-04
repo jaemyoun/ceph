@@ -56,8 +56,6 @@ struct ceph_file_layout {
 
 #define CEPH_MIN_STRIPE_UNIT 65536
 
-int ceph_file_layout_is_valid(const struct ceph_file_layout *layout);
-
 struct ceph_dir_layout {
 	__u8   dl_dir_hash;   /* see ceph_hash.h for ids */
 	__u8   dl_unused1;
@@ -133,6 +131,8 @@ struct ceph_dir_layout {
 
 /* FSMap subscribers (see all MDS clusters at once) */
 #define CEPH_MSG_FS_MAP                 45
+/* FSMapUser subscribers (get MDS clusters name->ID mapping) */
+#define CEPH_MSG_FS_MAP_USER		103
 
 
 /* watch-notify operations */
@@ -234,6 +234,11 @@ struct ceph_mon_subscribe_ack {
  */
 #define CEPH_MDSMAP_DOWN    (1<<0)  /* cluster deliberately down */
 #define CEPH_MDSMAP_ALLOW_SNAPS   (1<<1)  /* cluster allowed to create snapshots */
+#define CEPH_MDSMAP_ALLOW_MULTIMDS (1<<2) /* cluster allowed to have >1 active MDS */
+#define CEPH_MDSMAP_ALLOW_DIRFRAGS (1<<3) /* cluster allowed to fragment directories */
+
+#define CEPH_MDSMAP_ALLOW_CLASSICS (CEPH_MDSMAP_ALLOW_SNAPS | CEPH_MDSMAP_ALLOW_MULTIMDS | \
+				    CEPH_MDSMAP_ALLOW_DIRFRAGS)
 
 /*
  * mds states
@@ -248,7 +253,7 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDS_STATE_CREATING    -6  /* up, creating MDS instance. */
 #define CEPH_MDS_STATE_STARTING    -7  /* up, starting previously stopped mds */
 #define CEPH_MDS_STATE_STANDBY_REPLAY -8 /* up, tailing active node's journal */
-#define CEPH_MDS_STATE_REPLAYONCE   -9 /* up, replaying an active node's journal */
+#define CEPH_MDS_STATE_REPLAYONCE   -9 /* Legacy, unused */
 #define CEPH_MDS_STATE_NULL         -10
 
 #define CEPH_MDS_STATE_REPLAY       8  /* up, replaying journal. */
@@ -382,6 +387,18 @@ extern const char *ceph_mds_op_name(int op);
 #define CEPH_XATTR_REPLACE (1 << 1)
 #define CEPH_XATTR_REMOVE  (1 << 31)
 
+/*
+ * readdir request flags;
+ */
+#define CEPH_READDIR_REPLY_BITFLAGS	(1<<0)
+
+/*
+ * readdir reply flags.
+ */
+#define CEPH_READDIR_FRAG_END		(1<<0)
+#define CEPH_READDIR_FRAG_COMPLETE	(1<<8)
+#define CEPH_READDIR_HASH_ORDER		(1<<9)
+
 union ceph_mds_request_args {
 	struct {
 		__le32 mask;                 /* CEPH_CAP_* */
@@ -399,6 +416,7 @@ union ceph_mds_request_args {
 		__le32 frag;                 /* which dir fragment */
 		__le32 max_entries;          /* how many dentries to grab */
 		__le32 max_bytes;
+		__le16 flags;
 	} __attribute__ ((packed)) readdir;
 	struct {
 		__le32 mode;
@@ -414,7 +432,7 @@ union ceph_mds_request_args {
 		__le32 stripe_count;         /* ... */
 		__le32 object_size;
 		__le32 pool;                 /* if >= 0 and CREATEPOOLID feature */
-		__le32 unused;               /* used to be preferred */
+		__le32 mask;                 /* CEPH_CAP_* */
 		__le64 old_size;             /* if O_TRUNC */
 	} __attribute__ ((packed)) open;
 	struct {

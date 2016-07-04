@@ -54,6 +54,8 @@
 #include "journal/ReplayEntry.h"
 #include "journal/ReplayHandler.h"
 
+#include <boost/scope_exit.hpp>
+
 #define NUMPRINTCOLUMNS 32	/* # columns of data to print on each line */
 
 /*
@@ -140,6 +142,7 @@ unsigned long	debugstart = 0;		/* -D flag */
 int	flush_enabled = 0;		/* -f flag */
 int	holebdy = 1;			/* -h flag */
 bool    journal_replay = false;         /* -j flah */
+int	keep_on_success = 0;		/* -k flag */
 int	do_fsync = 0;			/* -y flag */
 unsigned long	maxfilelen = 256 * 1024;	/* -l flag */
 int	sizechecks = 1;			/* -n flag disables them */
@@ -394,6 +397,10 @@ int replay_journal(rados_ioctx_t ioctx, const char *image_name,
         journal::Journaler journaler(io_ctx, image_id, JOURNAL_CLIENT_ID, 0);
         C_SaferCond init_ctx;
         journaler.init(&init_ctx);
+        BOOST_SCOPE_EXIT_ALL( (&journaler) ) {
+                journaler.shut_down();
+        };
+
         r = init_ctx.wait();
         if (r < 0) {
                 simple_err("failed to initialize journal", r);
@@ -401,8 +408,13 @@ int replay_journal(rados_ioctx_t ioctx, const char *image_name,
         }
 
         journal::Journaler replay_journaler(io_ctx, replay_image_id, "", 0);
+
         C_SaferCond replay_init_ctx;
         replay_journaler.init(&replay_init_ctx);
+        BOOST_SCOPE_EXIT_ALL( (&replay_journaler) ) {
+                replay_journaler.shut_down();
+        };
+
         r = replay_init_ctx.wait();
         if (r < 0) {
                 simple_err("failed to initialize replay journal", r);
@@ -1045,7 +1057,7 @@ nbd_open(const char *name, struct rbd_ctx *ctx)
 
         r = process.spawn();
         if (r < 0) {
-		prt("nbd_open failed to run rbd-nbd error: %s\n", process.err());
+		prt("nbd_open failed to run rbd-nbd error: %s\n", process.err().c_str());
 		return r;
         }
 	r = safe_read(process.get_stdout(), dev, sizeof(dev));
@@ -1059,7 +1071,7 @@ nbd_open(const char *name, struct rbd_ctx *ctx)
 	dev[r] = 0;
 	r = process.join();
 	if (r) {
-		prt("rbd-nbd failed with error: %s", process.err());
+		prt("rbd-nbd failed with error: %s", process.err().c_str());
 		return -EINVAL;
 	}
 
@@ -1099,12 +1111,12 @@ nbd_close(struct rbd_ctx *ctx)
 
         r = process.spawn();
         if (r < 0) {
-		prt("nbd_close failed to run rbd-nbd error: %s\n", process.err());
+		prt("nbd_close failed to run rbd-nbd error: %s\n", process.err().c_str());
 		return r;
         }
 	r = process.join();
 	if (r) {
-		prt("rbd-nbd failed with error: %d", process.err());
+		prt("rbd-nbd failed with error: %d", process.err().c_str());
 		return -EINVAL;
 	}
 
@@ -2194,13 +2206,14 @@ void
 usage(void)
 {
 	fprintf(stdout, "usage: %s",
-		"fsx [-dfjnqxyACFHKLORUWZ] [-b opnum] [-c Prob] [-h holebdy] [-l flen] [-m start:end] [-o oplen] [-p progressinterval] [-r readbdy] [-s style] [-t truncbdy] [-w writebdy] [-D startingop] [-N numops] [-P dirpath] [-S seed] pname iname\n\
+		"fsx [-dfjknqxyACFHKLORUWZ] [-b opnum] [-c Prob] [-h holebdy] [-l flen] [-m start:end] [-o oplen] [-p progressinterval] [-r readbdy] [-s style] [-t truncbdy] [-w writebdy] [-D startingop] [-N numops] [-P dirpath] [-S seed] pname iname\n\
 	-b opnum: beginning operation number (default 1)\n\
 	-c P: 1 in P chance of file close+open at each op (default infinity)\n\
 	-d: debug output for all operations\n\
 	-f: flush and invalidate cache after I/O\n\
 	-h holebdy: 4096 would make discards page aligned (default 1)\n\
 	-j: journal replay stress test\n\
+	-k: keep data on success (default 0)\n\
 	-l flen: the upper bound on file size (default 262144)\n\
 	-m startop:endop: monitor (print debug output) specified byte range (default 0:infinity)\n\
 	-n: no verifications of file size\n\
@@ -2454,7 +2467,7 @@ main(int argc, char **argv)
 
 	setvbuf(stdout, (char *)0, _IOLBF, 0); /* line buffered stdout */
 
-	while ((ch = getopt(argc, argv, "b:c:dfh:jl:m:no:p:qr:s:t:w:xyACD:FHKMLN:OP:RS:UWZ"))
+	while ((ch = getopt(argc, argv, "b:c:dfh:jkl:m:no:p:qr:s:t:w:xyACD:FHKMLN:OP:RS:UWZ"))
 	       != EOF)
 		switch (ch) {
 		case 'b':
@@ -2489,6 +2502,9 @@ main(int argc, char **argv)
                 case 'j':
                         journal_replay = true;
                         break;
+		case 'k':
+			keep_on_success = 1;
+			break;
 		case 'l':
 			{
 				int _num = getnum(optarg, &endp);
@@ -2761,23 +2777,28 @@ main(int argc, char **argv)
 		check_clone(num_clones - 1, false);
         }
 
-	while (num_clones >= 0) {
-		static bool remove_snap = false;
+	if (!keep_on_success) {
+		while (num_clones >= 0) {
+			static bool remove_snap = false;
 
-                if (journal_replay) {
-                        char replayimagename[1024];
-                        replay_imagename(replayimagename,
-                                         sizeof(replayimagename), num_clones);
-                        remove_image(ioctx, replayimagename, remove_snap,
-                                     false);
-                }
+			if (journal_replay) {
+				char replayimagename[1024];
+				replay_imagename(replayimagename,
+						 sizeof(replayimagename),
+						 num_clones);
+				remove_image(ioctx, replayimagename,
+					     remove_snap,
+					     false);
+			}
 
-		char clonename[128];
-		clone_imagename(clonename, 128, num_clones);
-                remove_image(ioctx, clonename, remove_snap, journal_replay);
+			char clonename[128];
+			clone_imagename(clonename, 128, num_clones);
+			remove_image(ioctx, clonename, remove_snap,
+				     journal_replay);
 
-                remove_snap = true;
-		num_clones--;
+			remove_snap = true;
+			num_clones--;
+		}
 	}
 
 	prt("All operations completed A-OK!\n");

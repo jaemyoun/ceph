@@ -8,44 +8,33 @@
 #include "include/atomic.h"
 #include "include/Context.h"
 #include "include/interval_set.h"
-#include "include/rados/librados.hpp"
 #include "common/Mutex.h"
 #include "journal/Future.h"
+#include "journal/JournalMetadataListener.h"
 #include "journal/ReplayEntry.h"
 #include "journal/ReplayHandler.h"
 #include "librbd/journal/Types.h"
+#include "librbd/journal/TypeTraits.h"
 #include <algorithm>
-#include <iosfwd>
 #include <list>
 #include <string>
 #include <unordered_map>
 
-class Context;
 class ContextWQ;
 class SafeTimer;
 namespace journal {
 class Journaler;
 }
+namespace librados {
+  class IoCtx;
+}
 
 namespace librbd {
 
-class AioCompletion;
 class AioObjectRequest;
 class ImageCtx;
 
-namespace journal {
-
-template <typename> class Replay;
-
-template <typename ImageCtxT>
-struct TypeTraits {
-  typedef ::journal::Journaler Journaler;
-  typedef ::journal::Future Future;
-  typedef ::journal::ReplayEntry ReplayEntry;
-};
-
-} // namespace journal
-
+namespace journal { template <typename> class Replay; }
 
 template <typename ImageCtxT = ImageCtx>
 class Journal {
@@ -96,6 +85,7 @@ public:
 
   static const std::string IMAGE_CLIENT_ID;
   static const std::string LOCAL_MIRROR_UUID;
+  static const std::string ORPHAN_MIRROR_UUID;
 
   typedef std::list<AioObjectRequest *> AioObjectRequests;
 
@@ -105,9 +95,19 @@ public:
   static bool is_journal_supported(ImageCtxT &image_ctx);
   static int create(librados::IoCtx &io_ctx, const std::string &image_id,
 		    uint8_t order, uint8_t splay_width,
-		    const std::string &object_pool);
+		    const std::string &object_pool, bool non_primary,
+                    const std::string &primary_mirror_uuid);
   static int remove(librados::IoCtx &io_ctx, const std::string &image_id);
   static int reset(librados::IoCtx &io_ctx, const std::string &image_id);
+
+  static int is_tag_owner(ImageCtxT *image_ctx, bool *is_tag_owner);
+  static int is_tag_owner(librados::IoCtx& io_ctx, std::string& image_id,
+                          bool *is_tag_owner);
+  static int get_tag_owner(ImageCtxT *image_ctx, std::string *mirror_uuid);
+  static int get_tag_owner(librados::IoCtx& io_ctx, std::string& image_id,
+                           std::string *mirror_uuid);
+  static int request_resync(ImageCtxT *image_ctx);
+  static int promote(ImageCtxT *image_ctx);
 
   bool is_journal_ready() const;
   bool is_journal_replaying() const;
@@ -118,12 +118,22 @@ public:
   void close(Context *on_finish);
 
   bool is_tag_owner() const;
-  void allocate_tag(const std::string &mirror_uuid, Context *on_finish);
+  journal::TagData get_tag_data() const;
+  int demote();
+
+  void allocate_local_tag(Context *on_finish);
+  void allocate_tag(const std::string &mirror_uuid,
+                    const std::string &predecessor_mirror_uuid,
+                    bool predecessor_commit_valid, uint64_t predecessor_tag_tid,
+                    uint64_t predecessor_entry_tid, Context *on_finish);
 
   void flush_commit_position(Context *on_finish);
 
-  uint64_t append_io_event(AioCompletion *aio_comp,
-                           journal::EventEntry &&event_entry,
+  uint64_t append_write_event(uint64_t offset, size_t length,
+                              const bufferlist &bl,
+                              const AioObjectRequests &requests,
+                              bool flush_entry);
+  uint64_t append_io_event(journal::EventEntry &&event_entry,
                            const AioObjectRequests &requests,
                            uint64_t offset, size_t length,
                            bool flush_entry);
@@ -145,8 +155,16 @@ public:
     return op_tid;
   }
 
-  int start_external_replay(journal::Replay<ImageCtxT> **journal_replay);
+  void start_external_replay(journal::Replay<ImageCtxT> **journal_replay,
+                             Context *on_start, Context *on_close_request);
   void stop_external_replay();
+
+  void add_listener(journal::ListenerType type,
+                    journal::JournalListenerPtr listener);
+  void remove_listener(journal::ListenerType type,
+                       journal::JournalListenerPtr listener);
+
+  int check_resync_requested(bool *do_resync);
 
 private:
   ImageCtxT &m_image_ctx;
@@ -157,12 +175,13 @@ private:
   typedef typename TypeTraits::Future Future;
   typedef typename TypeTraits::ReplayEntry ReplayEntry;
 
+  typedef std::list<bufferlist> Bufferlists;
   typedef std::list<Context *> Contexts;
+  typedef std::list<Future> Futures;
   typedef interval_set<uint64_t> ExtentInterval;
 
   struct Event {
-    Future future;
-    AioCompletion *aio_comp = nullptr;
+    Futures futures;
     AioObjectRequests aio_object_requests;
     Contexts on_safe_contexts;
     ExtentInterval pending_extents;
@@ -172,9 +191,9 @@ private:
 
     Event() {
     }
-    Event(const Future &_future, AioCompletion *_aio_comp,
-          const AioObjectRequests &_requests, uint64_t offset, size_t length)
-      : future(_future), aio_comp(_aio_comp), aio_object_requests(_requests) {
+    Event(const Futures &_futures, const AioObjectRequests &_requests,
+          uint64_t offset, size_t length)
+      : futures(_futures), aio_object_requests(_requests) {
       if (length > 0) {
         pending_extents.insert(offset, length);
       }
@@ -253,6 +272,7 @@ private:
   Journaler *m_journaler;
   mutable Mutex m_lock;
   State m_state;
+  uint64_t m_max_append_size = 0;
   uint64_t m_tag_class = 0;
   uint64_t m_tag_tid = 0;
   journal::TagData m_tag_data;
@@ -270,10 +290,33 @@ private:
   atomic_t m_op_tid;
   TidToFutures m_op_futures;
 
+  bool m_processing_entry = false;
   bool m_blocking_writes;
 
   journal::Replay<ImageCtxT> *m_journal_replay;
+  Context *m_on_replay_close_request = nullptr;
 
+  struct MetadataListener : public ::journal::JournalMetadataListener {
+    Journal<ImageCtxT> *journal;
+
+    MetadataListener(Journal<ImageCtxT> *journal) : journal(journal) { }
+
+    void handle_update(::journal::JournalMetadata *) {
+      FunctionContext *ctx = new FunctionContext([this](int r) {
+        journal->handle_metadata_updated();
+      });
+      journal->m_work_queue->queue(ctx, 0);
+    }
+  } m_metadata_listener;
+
+  typedef std::map<journal::ListenerType,
+                   std::list<journal::JournalListenerPtr> > ListenerMap;
+  ListenerMap m_listener_map;
+
+  uint64_t append_io_events(journal::EventType event_type,
+                            const Bufferlists &bufferlists,
+                            const AioObjectRequests &requests,
+                            uint64_t offset, size_t length, bool flush_entry);
   Future wait_event(Mutex &lock, uint64_t tid, Context *on_safe);
 
   void create_journaler();
@@ -281,6 +324,8 @@ private:
   void recreate_journaler(int r);
 
   void complete_event(typename Events::iterator it, int r);
+
+  void start_append();
 
   void handle_initialized(int r);
   void handle_get_tags(int r);
@@ -290,8 +335,12 @@ private:
   void handle_replay_process_ready(int r);
   void handle_replay_process_safe(ReplayEntry replay_entry, int r);
 
+  void handle_start_external_replay(int r,
+                                    journal::Replay<ImageCtxT> **journal_replay,
+                                    Context *on_finish);
+
   void handle_flushing_restart(int r);
-  void handle_flushing_replay(int r);
+  void handle_flushing_replay();
 
   void handle_recording_stopped(int r);
 
@@ -307,6 +356,10 @@ private:
 
   bool is_steady_state() const;
   void wait_for_steady_state(Context *on_state);
+
+  int check_resync_requested_internal(bool *do_resync);
+
+  void handle_metadata_updated();
 };
 
 } // namespace librbd

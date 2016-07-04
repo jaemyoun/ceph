@@ -63,7 +63,7 @@ HARDENING_CFLAGS = \
                    --param=ssp-buffer-size=4 \
                    -fPIE
 
-SET_STACK_PROTECTOR_STRONG = $(shell expr `gcc -dumpversion` \>= 4.9)
+SET_STACK_PROTECTOR_STRONG = $(shell expr `$(CC) -dumpversion` \>= 4.9)
 
 		ifeq ($(SET_STACK_PROTECTOR_STRONG),1)
 				HARDENING_CFLAGS += -fstack-protector-strong
@@ -85,11 +85,11 @@ AM_COMMON_CPPFLAGS = \
 	-D__STDC_FORMAT_MACROS \
 	-D_GNU_SOURCE \
 	-DCEPH_LIBDIR=\"${libdir}\" \
-	-DCEPH_PKGLIBDIR=\"${pkglibdir}\" \
-	-DGTEST_USE_OWN_TR1_TUPLE=0
+	-DCEPH_PKGLIBDIR=\"${pkglibdir}\" 
 
 if LINUX
 AM_COMMON_CPPFLAGS += \
+	-DGTEST_USE_OWN_TR1_TUPLE=0 \
 	-D_REENTRANT
 endif
 
@@ -297,5 +297,10 @@ LIBCIVETWEB_DEPS =
 DENCODER_SOURCES =
 DENCODER_DEPS =
 
+# put virtualenvs in this directory
+# otherwise it may overflow #! 80 kernel limit
+# beware that some build environments might not be able to write to /tmp
+export TMPDIR ?= /tmp
+export CEPH_BUILD_VIRTUALENV = $(TMPDIR)
 
 radoslibdir = $(libdir)/rados-classes

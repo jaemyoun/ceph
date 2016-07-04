@@ -122,7 +122,7 @@ class Ptype(object):
 
     @staticmethod
     def get_ready_by_name(name):
-        return [x[name]['ready'] for x in PTYPE.values()]
+        return [x[name]['ready'] for x in PTYPE.values() if name in x]
 
     @staticmethod
     def is_regular_space(ptype):
@@ -406,7 +406,7 @@ def command(arguments, **kwargs):
     executable exists and raising a helpful error message
     if it does not.
 
-    .. note:: This should be the prefered way of calling ``subprocess.Popen``
+    .. note:: This should be the preferred way of calling ``subprocess.Popen``
     since it provides the caller with the safety net of making sure that
     executables *will* be found and will error nicely otherwise.
 
@@ -429,7 +429,7 @@ def command_check_call(arguments):
     Safely execute a ``subprocess.check_call`` call making sure that the
     executable exists and raising a helpful error message if it does not.
 
-    .. note:: This should be the prefered way of calling
+    .. note:: This should be the preferred way of calling
     ``subprocess.check_call`` since it provides the caller with the safety net
     of making sure that executables *will* be found and will error nicely
     otherwise.
@@ -1876,18 +1876,18 @@ class PrepareSpace(object):
         if stat.S_ISBLK(mode):
             if getattr(args, name + '_file'):
                 raise Error('%s is not a regular file' % name.capitalize,
-                            geattr(args, name))
+                            getattr(args, name))
             self.type = self.DEVICE
             return
 
         if stat.S_ISREG(mode):
             if getattr(args, name + '_dev'):
                 raise Error('%s is not a block device' % name.capitalize,
-                            geattr(args, name))
+                            getattr(args, name))
             self.type = self.FILE
 
         raise Error('%s %s is neither a block device nor regular file' %
-                    (name.capitalize, geattr(args, name)))
+                    (name.capitalize, getattr(args, name)))
 
     def is_none(self):
         return self.type == self.NONE
@@ -2241,8 +2241,8 @@ class Lockbox(object):
                       self.args.lockbox)
             self.partition = DevicePartition.factory(
                 path=None, dev=self.args.lockbox, args=self.args)
-            ptype = partition.get_ptype()
-            ready = Ptype.get_ready_by_type('lockbox')
+            ptype = self.partition.get_ptype()
+            ready = Ptype.get_ready_by_name('lockbox')
             if ptype not in ready:
                 LOG.warning('incorrect partition UUID: %s, expected %s'
                             % (ptype, str(ready)))
@@ -2384,7 +2384,7 @@ class PrepareData(object):
         elif stat.S_ISBLK(dmode):
             self.type = self.DEVICE
         else:
-            raise Error('not a dir or block device', args.data)
+            raise Error('not a dir or block device', self.args.data)
 
     def is_file(self):
         return self.type == self.FILE
@@ -2539,8 +2539,8 @@ class PrepareData(object):
                       self.args.data)
             self.partition = DevicePartition.factory(
                 path=None, dev=self.args.data, args=self.args)
-            ptype = partition.get_ptype()
-            ready = Ptype.get_ready_by_type('osd')
+            ptype = self.partition.get_ptype()
+            ready = Ptype.get_ready_by_name('osd')
             if ptype not in ready:
                 LOG.warning('incorrect partition UUID: %s, expected %s'
                             % (ptype, str(ready)))
@@ -2642,6 +2642,36 @@ class PrepareBluestoreData(PrepareData):
         write_one_line(path, 'type', 'bluestore')
 
 
+#
+# Temporary workaround: if ceph-osd --mkfs does not
+# complete within 5 minutes, assume it is blocked
+# because of http://tracker.ceph.com/issues/13522
+# and retry a few times.
+#
+# Remove this function calls with command_check_call
+# when http://tracker.ceph.com/issues/13522 is fixed
+#
+def ceph_osd_mkfs(arguments):
+    timeout = _get_command_executable(['timeout'])
+    mkfs_ok = False
+    error = 'unknown error'
+    for delay in os.environ.get('CEPH_OSD_MKFS_DELAYS',
+                                '300 300 300 300 300').split():
+        try:
+            _check_output(timeout + [delay] + arguments)
+            mkfs_ok = True
+            break
+        except subprocess.CalledProcessError as e:
+            error = e.output
+            if e.returncode == 124:  # timeout fired, retry
+                LOG.debug('%s timed out : %s (retry)'
+                          % (str(arguments), error))
+            else:
+                break
+    if not mkfs_ok:
+        raise Error('%s failed : %s' % (str(arguments), error))
+
+
 def mkfs(
     path,
     cluster,
@@ -2663,7 +2693,7 @@ def mkfs(
     osd_type = read_one_line(path, 'type')
 
     if osd_type == 'bluestore':
-        command_check_call(
+        ceph_osd_mkfs(
             [
                 'ceph-osd',
                 '--cluster', cluster,
@@ -2679,7 +2709,7 @@ def mkfs(
             ],
         )
     else:
-        command_check_call(
+        ceph_osd_mkfs(
             [
                 'ceph-osd',
                 '--cluster', cluster,
@@ -3974,7 +4004,7 @@ def list_format_plain(devices):
     for device in devices:
         if device.get('partitions'):
             lines.append('%s :' % device['path'])
-            for p in sorted(device['partitions']):
+            for p in sorted(device['partitions'], key=lambda x: x['path']):
                 lines.append(list_format_dev_plain(dev=p,
                                                    prefix=' '))
         else:

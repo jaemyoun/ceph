@@ -15,10 +15,7 @@
 #ifndef CEPH_PAXOSSERVICE_H
 #define CEPH_PAXOSSERVICE_H
 
-#include "messages/PaxosServiceMessage.h"
 #include "include/Context.h"
-#include "include/stringify.h"
-#include <errno.h>
 #include "Paxos.h"
 #include "Monitor.h"
 #include "MonitorDBStore.h"
@@ -257,11 +254,6 @@ private:
    *	   active
    */
   void _active();
-  /**
-   * Scrub our versions after we convert the store from the old layout to
-   * the new k/v store.
-   */
-  void remove_legacy_versions();
 
 public:
   /**
@@ -343,8 +335,6 @@ public:
   /**
    * Query the Paxos system for the latest state and apply it if it's newer
    * than the current Monitor state.
-   *
-   * @returns 'true' on success; 'false' otherwise.
    */
   virtual void update_from_paxos(bool *need_bootstrap) = 0;
 

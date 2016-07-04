@@ -365,8 +365,8 @@ public:
   int mount();
   int umount();
 
-  unsigned get_max_object_name_length() {
-    return 4096;
+  int validate_hobject_key(const hobject_t &obj) const override {
+    return 0;
   }
   unsigned get_max_attr_name_length() {
     return 256;  // arbitrary; there is no real limit internally
@@ -386,7 +386,7 @@ public:
     return false;
   }
 
-  int statfs(struct statfs *buf);
+  int statfs(struct store_statfs_t *buf) override;
 
   bool exists(const coll_t& cid, const ghobject_t& oid) override;
   bool exists(CollectionHandle &c, const ghobject_t& oid) override;
@@ -484,6 +484,10 @@ public:
 
   void set_fsid(uuid_d u);
   uuid_d get_fsid();
+
+  uint64_t estimate_objects_overhead(uint64_t num_objects) override {
+    return 0; //do not care
+  }
 
   objectstore_perf_stat_t get_cur_stats();
 

@@ -60,7 +60,6 @@ function run() {
     else
         echo "WARNING: Don't know how to install packages" >&2
     fi
-    sudo /sbin/modprobe rbd
 
     if test -f ./install-deps.sh ; then
 	$DRY_RUN ./install-deps.sh || return 1
@@ -76,8 +75,10 @@ function run() {
 function main() {
     if run "$@" ; then
         echo "make check: successful run on $(git rev-parse HEAD)"
+        rm -fr ${CEPH_BUILD_VIRTUALENV:-/tmp}/*virtualenv*
         return 0
     else
+        rm -fr ${CEPH_BUILD_VIRTUALENV:-/tmp}/*virtualenv*
         return 1
     fi
 }

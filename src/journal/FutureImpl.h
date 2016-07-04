@@ -18,7 +18,6 @@ class Context;
 namespace journal {
 
 class FutureImpl;
-class JournalMetadata;
 typedef boost::intrusive_ptr<FutureImpl> FutureImplPtr;
 
 class FutureImpl : public RefCountedObject, boost::noncopyable {
@@ -29,11 +28,9 @@ public:
     virtual void get() = 0;
     virtual void put() = 0;
   };
-  typedef boost::intrusive_ptr<JournalMetadata> JournalMetadataPtr;
   typedef boost::intrusive_ptr<FlushHandler> FlushHandlerPtr;
 
-  FutureImpl(JournalMetadataPtr journal_metadata, uint64_t tag_tid,
-             uint64_t entry_tid, uint64_t commit_tid);
+  FutureImpl(uint64_t tag_tid, uint64_t entry_tid, uint64_t commit_tid);
 
   void init(const FutureImplPtr &prev_future);
 
@@ -59,13 +56,14 @@ public:
   }
   inline void set_flush_in_progress() {
     Mutex::Locker locker(m_lock);
+    assert(m_flush_handler);
+    m_flush_handler.reset();
     m_flush_state = FLUSH_STATE_IN_PROGRESS;
   }
 
   bool attach(const FlushHandlerPtr &flush_handler);
   inline void detach() {
     Mutex::Locker locker(m_lock);
-    assert(m_flush_handler);
     m_flush_handler.reset();
   }
   inline FlushHandlerPtr get_flush_handler() const {
@@ -96,7 +94,6 @@ private:
     virtual void finish(int r) {}
   };
 
-  JournalMetadataPtr m_journal_metadata;
   uint64_t m_tag_tid;
   uint64_t m_entry_tid;
   uint64_t m_commit_tid;

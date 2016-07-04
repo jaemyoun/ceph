@@ -42,14 +42,12 @@ SimpleMessenger::SimpleMessenger(CephContext *cct, entity_name_t name,
 				 string mname, uint64_t _nonce, uint64_t features)
   : SimplePolicyMessenger(cct, name,mname, _nonce),
     accepter(this, _nonce),
-    dispatch_queue(cct, this),
+    dispatch_queue(cct, this, mname),
     reaper_thread(this),
     nonce(_nonce),
     lock("SimpleMessenger::lock"), need_addr(true), did_bind(false),
     global_seq(0),
     cluster_protocol(0),
-    dispatch_throttler(cct, string("msgr_dispatch_throttler-") + mname,
-		       cct->_conf->ms_dispatch_throttle_bytes),
     reaper_started(false), reaper_stop(false),
     timeout(0),
     local_connection(new PipeConnection(cct, this))
@@ -151,7 +149,7 @@ void SimpleMessenger::set_addr_unknowns(entity_addr_t &addr)
 {
   if (my_inst.addr.is_blank_ip()) {
     int port = my_inst.addr.get_port();
-    my_inst.addr.addr = addr.addr;
+    my_inst.addr.u = addr.u;
     my_inst.addr.set_port(port);
     init_local_connection();
   }
@@ -195,16 +193,6 @@ int SimpleMessenger::get_proto_version(int peer_type, bool connect)
  */
 #undef dout_prefix
 #define dout_prefix _prefix(_dout, this)
-
-void SimpleMessenger::dispatch_throttle_release(uint64_t msize)
-{
-  if (msize) {
-    ldout(cct,10) << "dispatch_throttle_release " << msize << " to dispatch throttler "
-	    << dispatch_throttler.get_current() << "/"
-	    << dispatch_throttler.get_max() << dendl;
-    dispatch_throttler.put(msize);
-  }
-}
 
 void SimpleMessenger::reaper_entry()
 {
@@ -484,6 +472,7 @@ void SimpleMessenger::submit_message(Message *m, PipeConnection *con,
   if (my_inst.addr == dest_addr) {
     // local
     ldout(cct,20) << "submit_message " << *m << " local" << dendl;
+    m->set_connection(local_connection.get());
     dispatch_queue.local_delivery(m, m->get_priority());
     return;
   }
@@ -705,9 +694,9 @@ void SimpleMessenger::learned_addr(const entity_addr_t &peer_addr_for_me)
   if (need_addr) {
     entity_addr_t t = peer_addr_for_me;
     t.set_port(my_inst.addr.get_port());
-    ANNOTATE_BENIGN_RACE_SIZED(&my_inst.addr.addr, sizeof(my_inst.addr.addr),
+    ANNOTATE_BENIGN_RACE_SIZED(&my_inst.addr.u, sizeof(my_inst.addr.u),
                                "SimpleMessenger learned addr");
-    my_inst.addr.addr = t.addr;
+    my_inst.addr.u = t.u;
     ldout(cct,1) << "learned my addr " << my_inst.addr << dendl;
     need_addr = false;
     init_local_connection();

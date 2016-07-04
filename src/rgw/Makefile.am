@@ -25,6 +25,7 @@ librgw_la_SOURCES = \
 	rgw/rgw_acl.cc \
 	rgw/rgw_acl_s3.cc \
 	rgw/rgw_acl_swift.cc \
+	rgw/rgw_auth.cc \
 	rgw/rgw_coroutine.cc \
 	rgw/rgw_cr_rados.cc \
 	rgw/rgw_tools.cc \
@@ -44,7 +45,6 @@ librgw_la_SOURCES = \
 	rgw/rgw_http_client.cc \
 	rgw/rgw_json_enc.cc \
 	rgw/rgw_keystone.cc \
-	rgw/rgw_ldap.cc \
 	rgw/rgw_loadgen.cc \
 	rgw/rgw_log.cc \
 	rgw/rgw_metadata.cc \
@@ -83,7 +83,6 @@ librgw_la_SOURCES = \
 	rgw/rgw_rest_usage.cc \
 	rgw/rgw_rest_user.cc \
 	rgw/rgw_swift_auth.cc \
-	rgw/rgw_swift.cc \
 	rgw/rgw_usage.cc \
 	rgw/rgw_user.cc \
 	rgw/rgw_file.cc \
@@ -91,6 +90,11 @@ librgw_la_SOURCES = \
 	rgw/rgw_xml.cc \
 	rgw/rgw_xml_enc.cc \
 	rgw/rgw_website.cc
+
+if WITH_OPENLDAP
+librgw_la_SOURCES += rgw/rgw_ldap.cc
+
+endif
 
 librgw_la_CXXFLAGS = -Woverloaded-virtual -fPIC -I$(srcdir)/xxHash \
 	${AM_CXXFLAGS}
@@ -110,8 +114,17 @@ LIBRGW_DEPS += \
 	-lcurl \
 	-lexpat \
 	-lm \
-	-lfcgi \
-	-ldl
+	-lfcgi 
+
+if LINUX
+LIBRGW_DEPS += \
+        -ldl
+endif
+
+if WITH_OPENLDAP
+LIBRGW_DEPS += \
+      -lldap
+endif
 
 librgw_la_LIBADD = $(LIBRGW_DEPS) \
 	$(PTHREAD_LIBS) $(RESOLV_LIBS) libglobal.la \
@@ -130,8 +143,8 @@ libcivetweb_la_SOURCES =  \
 
 libcivetweb_la_CXXFLAGS = ${CIVETWEB_INCLUDE} -fPIC -Woverloaded-virtual \
 	${AM_CXXFLAGS}
-libcivetweb_la_CFLAGS = -I$(srcdir)/civetweb/include ${CIVETWEB_INCLUDE} -fPIC -DNO_SSL_DL
-LIBCIVETWEB_DEPS += -lssl -lcrypto
+libcivetweb_la_CFLAGS = -I$(srcdir)/civetweb/include ${CIVETWEB_INCLUDE} ${SSL_INCLUDES} -fPIC -DNO_SSL_DL
+LIBCIVETWEB_DEPS += ${SSL_LIBS}
 
 noinst_LTLIBRARIES += libcivetweb.la
 
@@ -177,6 +190,8 @@ noinst_HEADERS += \
 	rgw/rgw_acl.h \
 	rgw/rgw_acl_s3.h \
 	rgw/rgw_acl_swift.h \
+	rgw/rgw_auth.h \
+	rgw/rgw_auth_decoimpl.h \
 	rgw/rgw_b64.h \
 	rgw/rgw_client_io.h \
 	rgw/rgw_coroutine.h \
@@ -214,7 +229,6 @@ noinst_HEADERS += \
 	rgw/rgw_os_lib.h \
 	rgw/rgw_orphan.h \
 	rgw/rgw_http_client.h \
-	rgw/rgw_swift.h \
 	rgw/rgw_swift_auth.h \
 	rgw/rgw_quota.h \
 	rgw/rgw_rados.h \

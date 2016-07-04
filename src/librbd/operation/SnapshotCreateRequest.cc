@@ -7,7 +7,6 @@
 #include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/ImageWatcher.h"
 #include "librbd/ObjectMap.h"
 #include "librbd/Utils.h"
 
@@ -62,9 +61,10 @@ template <typename I>
 SnapshotCreateRequest<I>::SnapshotCreateRequest(I &image_ctx,
                                                 Context *on_finish,
                                                 const std::string &snap_name,
-                                                uint64_t journal_op_tid)
+                                                uint64_t journal_op_tid,
+                                                bool skip_object_map)
   : Request<I>(image_ctx, on_finish, journal_op_tid), m_snap_name(snap_name),
-    m_ret_val(0), m_snap_id(CEPH_NOSNAP) {
+    m_skip_object_map(skip_object_map), m_ret_val(0), m_snap_id(CEPH_NOSNAP) {
 }
 
 template <typename I>
@@ -247,7 +247,7 @@ Context *SnapshotCreateRequest<I>::send_create_object_map() {
   update_snap_context();
 
   image_ctx.snap_lock.get_read();
-  if (image_ctx.object_map == nullptr) {
+  if (image_ctx.object_map == nullptr || m_skip_object_map) {
     image_ctx.snap_lock.put_read();
 
     finalize(0);

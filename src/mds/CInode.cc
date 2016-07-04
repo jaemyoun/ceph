@@ -807,9 +807,14 @@ bool CInode::is_projected_ancestor_of(CInode *other)
   return false;
 }
 
-void CInode::make_path_string(string& s, bool force, CDentry *use_parent) const
+/*
+ * If use_parent is NULL (it should be one of inode's projected parents),
+ * we use it to make path string. Otherwise, we use inode's parent dentry
+ * to make path string
+ */
+void CInode::make_path_string(string& s, CDentry *use_parent) const
 {
-  if (!force)
+  if (!use_parent)
     use_parent = parent;
 
   if (use_parent) {
@@ -844,7 +849,7 @@ void CInode::make_path_string_projected(string& s) const
 	 p != projected_parent.end();
 	 ++p) {
       string q;
-      make_path_string(q, true, *p);
+      make_path_string(q, *p);
       s += " ";
       s += q;
     }
@@ -995,6 +1000,7 @@ void CInode::_stored(int r, version_t v, Context *fin)
     mdcache->mds->clog->error() << "failed to store ino " << ino() << " object,"
 				<< " errno " << r << "\n";
     mdcache->mds->handle_write_error(r);
+    fin->complete(r);
     return;
   }
 
@@ -1143,13 +1149,7 @@ void CInode::store_backtrace(MDSInternalContextBase *fin, int op_prio)
 
   auth_pin(this);
 
-  int64_t pool;
-  if (is_dir()) {
-    pool = mdcache->mds->mdsmap->get_metadata_pool();
-  } else {
-    pool = inode.layout.pool_id;
-  }
-
+  const int64_t pool = get_backtrace_pool();
   inode_backtrace_t bt;
   build_backtrace(pool, bt);
   bufferlist parent_bl;
@@ -1212,9 +1212,13 @@ void CInode::_stored_backtrace(int r, version_t v, Context *fin)
 {
   if (r < 0) {
     dout(1) << "store backtrace error " << r << " v " << v << dendl;
-    mdcache->mds->clog->error() << "failed to store backtrace on dir ino "
-				<< ino() << " object, errno " << r << "\n";
+    mdcache->mds->clog->error() << "failed to store backtrace on ino "
+				<< ino() << " object"
+                                << ", pool " << get_backtrace_pool()
+                                << ", errno " << r << "\n";
     mdcache->mds->handle_write_error(r);
+    if (fin)
+      fin->complete(r);
     return;
   }
 
@@ -1229,13 +1233,7 @@ void CInode::_stored_backtrace(int r, version_t v, Context *fin)
 
 void CInode::fetch_backtrace(Context *fin, bufferlist *backtrace)
 {
-  int64_t pool;
-  if (is_dir())
-    pool = mdcache->mds->mdsmap->get_metadata_pool();
-  else
-    pool = inode.layout.pool_id;
-
-  mdcache->fetch_backtrace(inode.ino, pool, *backtrace, fin);
+  mdcache->fetch_backtrace(inode.ino, get_backtrace_pool(), *backtrace, fin);
 }
 
 void CInode::_mark_dirty_parent(LogSegment *ls, bool dirty_pool)
@@ -1979,6 +1977,7 @@ void CInode::finish_scatter_gather_update(int type)
     {
       fragtree_t tmpdft = dirfragtree;
       struct frag_info_t dirstat;
+      bool dirstat_valid = true;
 
       // adjust summation
       assert(is_auth());
@@ -1994,7 +1993,13 @@ void CInode::finish_scatter_gather_update(int type)
 	CDir *dir = p->second;
 	dout(20) << fg << " " << *dir << dendl;
 
-	bool update = dir->is_auth() && dir->get_version() != 0 &&  !dir->is_frozen();
+	bool update;
+	if (dir->get_version() != 0) {
+	  update = dir->is_auth() && !dir->is_frozen();
+	} else {
+	  update = false;
+	  dirstat_valid = false;
+	}
 
 	fnode_t *pf = dir->get_projected_fnode();
 	if (update)
@@ -2033,16 +2038,15 @@ void CInode::finish_scatter_gather_update(int type)
 	pi->mtime = pi->ctime = pi->dirstat.mtime;
       dout(20) << " final dirstat " << pi->dirstat << dendl;
 
-      if (!dirstat.same_sums(pi->dirstat)) {
-	bool all = true;
+      if (dirstat_valid && !dirstat.same_sums(pi->dirstat)) {
 	list<frag_t> ls;
 	tmpdft.get_leaves_under(frag_t(), ls);
 	for (list<frag_t>::iterator p = ls.begin(); p != ls.end(); ++p)
 	  if (!dirfrags.count(*p)) {
-	    all = false;
+	    dirstat_valid = false;
 	    break;
 	  }
-	if (all) {
+	if (dirstat_valid) {
 	  if (state_test(CInode::STATE_REPAIRSTATS)) {
 	    dout(20) << " dirstat mismatch, fixing" << dendl;
 	  } else {
@@ -2078,6 +2082,7 @@ void CInode::finish_scatter_gather_update(int type)
       fragtree_t tmpdft = dirfragtree;
       nest_info_t rstat;
       rstat.rsubdirs = 1;
+      bool rstat_valid = true;
 
       // adjust summation
       assert(is_auth());
@@ -2091,7 +2096,13 @@ void CInode::finish_scatter_gather_update(int type)
 	CDir *dir = p->second;
 	dout(20) << fg << " " << *dir << dendl;
 
-	bool update = dir->is_auth() && dir->get_version() != 0 && !dir->is_frozen();
+	bool update;
+	if (dir->get_version() != 0) {
+	  update = dir->is_auth() && !dir->is_frozen();
+	} else {
+	  update = false;
+	  rstat_valid = false;
+	}
 
 	fnode_t *pf = dir->get_projected_fnode();
 	if (update)
@@ -2132,16 +2143,15 @@ void CInode::finish_scatter_gather_update(int type)
       }
       dout(20) << " final rstat " << pi->rstat << dendl;
 
-      if (!rstat.same_sums(pi->rstat)) {
-	bool all = true;
+      if (rstat_valid && !rstat.same_sums(pi->rstat)) {
 	list<frag_t> ls;
 	tmpdft.get_leaves_under(frag_t(), ls);
 	for (list<frag_t>::iterator p = ls.begin(); p != ls.end(); ++p)
 	  if (!dirfrags.count(*p)) {
-	    all = false;
+	    rstat_valid = false;
 	    break;
 	  }
-	if (all) {
+	if (rstat_valid) {
 	  if (state_test(CInode::STATE_REPAIRSTATS)) {
 	    dout(20) << " rstat mismatch, fixing" << dendl;
 	  } else {
@@ -3725,12 +3735,7 @@ void CInode::validate_disk_state(CInode::validated_data *results,
     void fetch_backtrace_and_tag(CInode *in, std::string tag,
                                  Context *fin, int *bt_r, bufferlist *bt)
     {
-      int64_t pool;
-      if (in->is_dir())
-        pool = in->mdcache->mds->mdsmap->get_metadata_pool();
-      else
-        pool = in->inode.layout.pool_id;
-
+      const int64_t pool = in->get_backtrace_pool();
       object_t oid = CInode::get_object_name(in->ino(), frag_t(), "");
 
       ObjectOperation fetch;
@@ -3788,11 +3793,7 @@ void CInode::validate_disk_state(CInode::validated_data *results,
       results->performed_validation = true; // at least, some of it!
       results->backtrace.checked = true;
 
-      int64_t pool;
-      if (in->is_dir())
-        pool = in->mdcache->mds->mdsmap->get_metadata_pool();
-      else
-        pool = in->inode.layout.pool_id;
+      const int64_t pool = in->get_backtrace_pool();
       inode_backtrace_t& memory_backtrace = results->backtrace.memory_value;
       in->build_backtrace(pool, memory_backtrace);
       bool equivalent, divergent;
@@ -4173,12 +4174,10 @@ void CInode::scrub_initialize(CDentry *scrub_parent,
 			      MDSInternalContextBase *f)
 {
   dout(20) << __func__ << " with scrub_version " << get_version() << dendl;
-  assert(!scrub_infop || !scrub_infop->scrub_in_progress);
+  assert(!scrub_is_in_progress());
   scrub_info();
   if (!scrub_infop)
     scrub_infop = new scrub_info_t();
-  else
-    assert(!scrub_infop->scrub_in_progress);
 
   if (get_projected_inode()->is_dir()) {
     // fill in dirfrag_stamps with initial state
@@ -4210,7 +4209,7 @@ void CInode::scrub_initialize(CDentry *scrub_parent,
 int CInode::scrub_dirfrag_next(frag_t* out_dirfrag)
 {
   dout(20) << __func__ << dendl;
-  assert(scrub_infop && scrub_infop->scrub_in_progress);
+  assert(scrub_is_in_progress());
 
   if (!is_dir()) {
     return -ENOTDIR;
@@ -4258,7 +4257,7 @@ void CInode::scrub_dirfrags_scrubbing(list<frag_t>* out_dirfrags)
 void CInode::scrub_dirfrag_finished(frag_t dirfrag)
 {
   dout(20) << __func__ << " on frag " << dirfrag << dendl;
-  assert(scrub_infop && scrub_infop->scrub_in_progress);
+  assert(scrub_is_in_progress());
 
   std::map<frag_t, scrub_stamp_info_t>::iterator i =
       scrub_infop->dirfrag_stamps.find(dirfrag);
@@ -4271,7 +4270,7 @@ void CInode::scrub_dirfrag_finished(frag_t dirfrag)
 
 void CInode::scrub_finished(MDSInternalContextBase **c) {
   dout(20) << __func__ << dendl;
-  assert(scrub_info()->scrub_in_progress);
+  assert(scrub_is_in_progress());
   for (std::map<frag_t, scrub_stamp_info_t>::iterator i =
       scrub_infop->dirfrag_stamps.begin();
       i != scrub_infop->dirfrag_stamps.end();
@@ -4302,5 +4301,17 @@ void CInode::scrub_finished(MDSInternalContextBase **c) {
     // We are at the point that a tagging scrub was initiated
     LogChannelRef clog = mdcache->mds->clog;
     clog->info() << "scrub complete with tag '" << scrub_infop->header->tag << "'";
+  }
+}
+
+int64_t CInode::get_backtrace_pool() const
+{
+  if (is_dir()) {
+    return mdcache->mds->mdsmap->get_metadata_pool();
+  } else {
+    // Files are required to have an explicit layout that specifies
+    // a pool
+    assert(inode.layout.pool_id != -1);
+    return inode.layout.pool_id;
   }
 }

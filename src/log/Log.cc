@@ -24,6 +24,8 @@
 #include "include/compat.h"
 #include "include/on_exit.h"
 #include "include/uuid.h"
+#include "Entry.h"
+#include "SubsystemMap.h"
 
 #define DEFAULT_MAX_NEW    100
 #define DEFAULT_MAX_RECENT 10000
@@ -140,7 +142,7 @@ void Log::reopen_log_file()
     VOID_TEMP_FAILURE_RETRY(::close(m_fd));
   if (m_log_file.length()) {
     m_fd = ::open(m_log_file.c_str(), O_CREAT|O_WRONLY|O_APPEND, 0644);
-    if (m_uid || m_gid) {
+    if (m_fd >= 0 && (m_uid || m_gid)) {
       int r = ::fchown(m_fd, m_uid, m_gid);
       if (r < 0) {
 	r = -errno;
@@ -329,7 +331,7 @@ void Log::_flush(EntryQueue *t, EntryQueue *requeue, bool crash)
       }
 
       if (do_syslog) {
-        syslog(LOG_USER|LOG_DEBUG, "%s", buf);
+        syslog(LOG_USER|LOG_INFO, "%s", buf);
       }
 
       if (do_stderr) {
@@ -367,7 +369,7 @@ void Log::_log_message(const char *s, bool crash)
       cerr << "problem writing to " << m_log_file << ": " << cpp_strerror(r) << std::endl;
   }
   if ((crash ? m_syslog_crash : m_syslog_log) >= 0) {
-    syslog(LOG_USER|LOG_DEBUG, "%s", s);
+    syslog(LOG_USER|LOG_INFO, "%s", s);
   }
 
   if ((crash ? m_stderr_crash : m_stderr_log) >= 0) {

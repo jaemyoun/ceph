@@ -146,10 +146,14 @@ void ScrubStack::scrub_dir_inode(CInode *in,
 	++i) {
       // turn frags into CDir *
       CDir *dir = in->get_dirfrag(*i);
-      scrubbing_cdirs.push_back(dir);
-      dout(25) << __func__ << " got CDir " << *dir << " presently scrubbing" << dendl;
+      if (dir) {
+	scrubbing_cdirs.push_back(dir);
+	dout(25) << __func__ << " got CDir " << *dir << " presently scrubbing" << dendl;
+      } else {
+	in->scrub_dirfrag_finished(*i);
+	dout(25) << __func__ << " missing dirfrag " << *i << " skip scrubbing" << dendl;
+      }
     }
-
 
     dout(20) << __func__ << " consuming from " << scrubbing_cdirs.size()
 	     << " scrubbing cdirs" << dendl;
@@ -203,7 +207,7 @@ void ScrubStack::scrub_dir_inode(CInode *in,
 
     // OK, so now I can... fire off a validate on the dir inode, and
     // when it completes, come through here again, noticing that we've
-    // set a flag to indicate the the validate happened, and 
+    // set a flag to indicate the validate happened, and 
     scrub_dir_inode_final(in);
   }
 
@@ -341,18 +345,7 @@ void ScrubStack::scrub_dirfrag(CDir *dir,
       return;
     }
 
-    if (r < 0) {
-      // FIXME: how can I handle an error here?  I can't hold someone up
-      // forever, but I can't say "sure you're scrubbed"
-      //  -- should change scrub_dentry_next definition to never
-      //  give out IO errors (handle them some other way)
-      //     
-      derr << __func__ << " error from scrub_dentry_next: "
-           << r << dendl;
-      return;
-    }
-
-    // scrub_dentry_next defined to only give -ve, EAGAIN, ENOENT, 0 -- we should
+    // scrub_dentry_next defined to only give EAGAIN, ENOENT, 0 -- we should
     // never get random IO errors here.
     assert(r == 0);
 

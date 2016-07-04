@@ -31,9 +31,9 @@ add_library(ec_jerasure_generic SHARED
   $<TARGET_OBJECTS:erasure_code_objs>
   )
 add_dependencies(ec_jerasure_generic ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
-target_link_libraries(ec_jerasure_generic ${EXTRALIBS})
+target_link_libraries(ec_jerasure_generic crush ${EXTRALIBS})
 set_target_properties(ec_jerasure_generic PROPERTIES VERSION 2.0.0 SOVERSION 2)
-install(TARGETS ec_jerasure_generic DESTINATION lib/erasure-code)
+install(TARGETS ec_jerasure_generic DESTINATION ${erasure_plugin_dir})
 
 # ec_jerasure_neon
 #TODO:build libec_jerasure_neon library on an ARM machine
@@ -57,7 +57,7 @@ if(ARM_NEON OR ARM_NEON2)
   target_link_libraries(ec_jerasure_neon crush pthread ${EXTRALIBS})
   set_target_properties(ec_jerasure_neon PROPERTIES VERSION 2.0.0 SOVERSION 2
     COMPILE_FLAGS ${ARM_NEON_FLAGS})
-  install(TARGETS ec_jerasure_neon DESTINATION lib/erasure-code)
+  install(TARGETS ec_jerasure_neon DESTINATION ${erasure_plugin_dir})
 endif(ARM_NEON OR ARM_NEON2)
 
 # ec_jerasure_sse3
@@ -68,10 +68,10 @@ if(INTEL_SSE)
     $<TARGET_OBJECTS:erasure_code_objs>
     )
   add_dependencies(ec_jerasure_sse3 ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
-  target_link_libraries(ec_jerasure_sse3 ${EXTRALIBS})
+  target_link_libraries(ec_jerasure_sse3 crush ${EXTRALIBS})
   set_target_properties(ec_jerasure_sse3 PROPERTIES VERSION 2.0.0 SOVERSION 2
     COMPILE_FLAGS ${SSE3_FLAGS})
-  install(TARGETS ec_jerasure_sse3 DESTINATION lib/erasure-code)
+  install(TARGETS ec_jerasure_sse3 DESTINATION ${erasure_plugin_dir})
 endif(INTEL_SSE)
 
 # ec_jerasure_sse4
@@ -82,14 +82,14 @@ if(INTEL_SSE4_1)
     $<TARGET_OBJECTS:erasure_code_objs>
     )
   add_dependencies(ec_jerasure_sse4 ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
-  target_link_libraries(ec_jerasure_sse4 ${EXTRALIBS})
+  target_link_libraries(ec_jerasure_sse4 crush ${EXTRALIBS})
   set_target_properties(ec_jerasure_sse4 PROPERTIES VERSION 2.0.0 SOVERSION 2
     COMPILE_FLAGS ${SSE4_FLAGS})
-  install(TARGETS ec_jerasure_sse4 DESTINATION lib/erasure-code)
+  install(TARGETS ec_jerasure_sse4 DESTINATION ${erasure_plugin_dir})
 endif(INTEL_SSE4_1)
 
 add_library(ec_jerasure SHARED ErasureCodePluginSelectJerasure.cc)
 add_dependencies(ec_jerasure ${CMAKE_SOURCE_DIR}/src/ceph_ver.h)
 target_link_libraries(ec_jerasure ${EXTRALIBS})
 set_target_properties(ec_jerasure PROPERTIES VERSION 2.0.0 SOVERSION 2)
-install(TARGETS ec_jerasure DESTINATION lib/erasure-code)
+install(TARGETS ec_jerasure DESTINATION ${erasure_plugin_dir})

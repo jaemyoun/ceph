@@ -241,10 +241,9 @@ uint64_t Striper::object_truncate_size(CephContext *cct,
 uint64_t Striper::get_num_objects(const file_layout_t& layout,
 				  uint64_t size)
 {
-  __u32 object_size = layout.object_size;
   __u32 stripe_unit = layout.stripe_unit;
   __u32 stripe_count = layout.stripe_count;
-  uint64_t period = (uint64_t)stripe_count * object_size;
+  uint64_t period = layout.get_period();
   uint64_t num_periods = (size + period - 1) / period;
   uint64_t remainder_bytes = size % period;
   uint64_t remainder_objs = 0;
@@ -402,7 +401,7 @@ void Striper::StripedReadResult::assemble_result(CephContext *cct, char *buffer,
   uint64_t end = p->first + p->second.second;
   while (p != partial.rend()) {
     // sanity check
-    ldout(cct, 0) << "assemble_result(" << this << ") " << p->first << "~" << p->second.second
+    ldout(cct, 20) << "assemble_result(" << this << ") " << p->first << "~" << p->second.second
 		   << " " << p->second.first.length() << " bytes"
 		   << dendl;
     assert(p->first == end - p->second.second);

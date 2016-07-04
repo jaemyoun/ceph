@@ -8,7 +8,6 @@
 #include "include/Context.h"
 #include "include/rados/librados.hpp"
 #include "common/Mutex.h"
-#include "common/RWLock.h"
 #include <list>
 #include <string>
 #include <utility>
@@ -30,7 +29,10 @@ public:
   ~ExclusiveLock();
 
   bool is_lock_owner() const;
-  bool accept_requests() const;
+  bool accept_requests(int *ret_val) const;
+
+  void block_requests(int r);
+  void unblock_requests();
 
   void init(uint64_t features, Context *on_init);
   void shut_down(Context *on_shutdown);
@@ -67,7 +69,7 @@ private:
    *    |
    *    |
    *    v
-   * SHUTTING_DOWN ---> SHUTDOWN ---> <finish>
+   * PRE_SHUTTING_DOWN ---> SHUTTING_DOWN ---> SHUTDOWN ---> <finish>
    */
   enum State {
     STATE_UNINITIALIZED,
@@ -79,6 +81,7 @@ private:
     STATE_WAITING_FOR_PEER,
     STATE_PRE_RELEASING,
     STATE_RELEASING,
+    STATE_PRE_SHUTTING_DOWN,
     STATE_SHUTTING_DOWN,
     STATE_SHUTDOWN,
   };
@@ -126,6 +129,9 @@ private:
 
   ActionsContexts m_actions_contexts;
 
+  bool m_request_blocked = false;
+  int m_request_blocked_ret_val = 0;
+
   std::string encode_lock_cookie() const;
 
   bool is_transition_state() const;
@@ -151,6 +157,8 @@ private:
 
   void send_shutdown();
   void send_shutdown_release();
+  void handle_shutdown_releasing(int r);
+  void handle_shutdown_released(int r);
   void handle_shutdown(int r);
   void complete_shutdown(int r);
 };

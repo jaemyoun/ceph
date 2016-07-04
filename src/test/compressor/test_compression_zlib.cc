@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
 #include <gtest/gtest.h>
 #include "global/global_init.h"
@@ -26,7 +27,7 @@
 TEST(CompressionZlib, compress_decompress)
 {
   CompressionZlib sp;
-  EXPECT_EQ(sp.get_method_name(), "zlib");
+  EXPECT_STREQ(sp.get_type().c_str(), "zlib");
   const char* test = "This is test text";
   int len = strlen(test);
   bufferlist in, out;
@@ -36,13 +37,22 @@ TEST(CompressionZlib, compress_decompress)
   bufferlist after;
   res = sp.decompress(out, after);
   EXPECT_EQ(res, 0);
-  EXPECT_STREQ(test, after.c_str());
+  bufferlist exp;
+  exp.append(test);
+  EXPECT_TRUE(exp.contents_equal(after));
+  after.clear();
+  size_t compressed_len = out.length();
+  out.append_zero(12);
+  auto it = out.begin();
+  res = sp.decompress(it, compressed_len, after);
+  EXPECT_EQ(res, 0);
+  EXPECT_TRUE(exp.contents_equal(after));
 }
 
 TEST(CompressionZlib, compress_decompress_chunk)
 {
   CompressionZlib sp;
-  EXPECT_EQ(sp.get_method_name(), "zlib");
+  EXPECT_STREQ(sp.get_type().c_str(), "zlib");
   const char* test = "This is test text";
   buffer::ptr test2 ("1234567890", 10);
   int len = strlen(test);
@@ -54,7 +64,9 @@ TEST(CompressionZlib, compress_decompress_chunk)
   bufferlist after;
   res = sp.decompress(out, after);
   EXPECT_EQ(res, 0);
-  EXPECT_STREQ("This is test text1234567890", after.c_str());
+  bufferlist exp;
+  exp.append("This is test text1234567890");
+  EXPECT_TRUE(exp.contents_equal(after));
 }
 
 int main(int argc, char **argv) {
@@ -63,8 +75,6 @@ int main(int argc, char **argv) {
 
   global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
-
-  g_conf->set_val("compression_dir", ".libs", false, false);
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

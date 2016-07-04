@@ -52,6 +52,25 @@ namespace librbd {
     std::string client_name;
   } mirror_peer_t;
 
+  typedef rbd_mirror_image_state_t mirror_image_state_t;
+
+  typedef struct {
+    std::string global_id;
+    mirror_image_state_t state;
+    bool primary;
+  } mirror_image_info_t;
+
+  typedef rbd_mirror_image_status_state_t mirror_image_status_state_t;
+
+  typedef struct {
+    std::string name;
+    mirror_image_info_t info;
+    mirror_image_status_state_t state;
+    std::string description;
+    time_t last_update;
+    bool up;
+  } mirror_image_status_t;
+
   typedef rbd_image_info_t image_info_t;
 
   class CEPH_RBD_API ProgressContext
@@ -124,6 +143,15 @@ public:
                              const std::string &client_name);
   int mirror_peer_set_cluster(IoCtx& io_ctx, const std::string &uuid,
                               const std::string &cluster_name);
+  int mirror_image_status_list(IoCtx& io_ctx, const std::string &start_id,
+      size_t max, std::map<std::string, mirror_image_status_t> *images);
+  int mirror_image_status_summary(IoCtx& io_ctx,
+      std::map<mirror_image_status_state_t, int> *states);
+
+  // RBD consistency groups support functions
+  int group_create(IoCtx& io_ctx, const char *group_name);
+  int group_remove(IoCtx& io_ctx, const char *group_name);
+  int group_list(IoCtx& io_ctx, std::vector<std::string>& names);
 
 private:
   /* We don't allow assignment or copying */
@@ -141,6 +169,7 @@ public:
   int set(int optname, uint64_t optval);
   int get(int optname, std::string* optval) const;
   int get(int optname, uint64_t* optval) const;
+  int is_set(int optname, bool* is_set);
   int unset(int optname);
   void clear();
   bool empty() const;
@@ -179,6 +208,8 @@ public:
 
   /* object map feature */
   int rebuild_object_map(ProgressContext &prog_ctx);
+
+  int check_object_map(ProgressContext &prog_ctx);
 
   int copy(IoCtx& dest_io_ctx, const char *destname);
   int copy2(Image& dest);
@@ -223,6 +254,8 @@ public:
   int snap_is_protected(const char *snap_name, bool *is_protected);
   int snap_set(const char *snap_name);
   int snap_rename(const char *srcname, const char *dstname);
+  int snap_get_limit(uint64_t *limit);
+  int snap_set_limit(uint64_t limit);
 
   /* I/O */
   ssize_t read(uint64_t ofs, size_t len, ceph::bufferlist& bl);
@@ -320,6 +353,17 @@ public:
    * Returns a pair of key/value for this image
    */
   int metadata_list(const std::string &start, uint64_t max, std::map<std::string, ceph::bufferlist> *pairs);
+
+  // RBD image mirroring support functions
+  int mirror_image_enable();
+  int mirror_image_disable(bool force);
+  int mirror_image_promote(bool force);
+  int mirror_image_demote();
+  int mirror_image_resync();
+  int mirror_image_get_info(mirror_image_info_t *mirror_image_info,
+                            size_t info_size);
+  int mirror_image_get_status(mirror_image_status_t *mirror_image_status,
+			      size_t status_size);
 
 private:
   friend class RBD;

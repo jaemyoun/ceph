@@ -66,13 +66,14 @@ MDSRank::MDSRank(
     stopping(false),
     progress_thread(this), dispatch_depth(0),
     hb(NULL), last_tid(0), osd_epoch_barrier(0), beacon(beacon_),
+    mds_slow_req_count(0),
     last_client_mdsmap_bcast(0),
     messenger(msgr), monc(monc_),
     respawn_hook(respawn_hook_),
     suicide_hook(suicide_hook_),
     standby_replaying(false)
 {
-  hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank");
+  hb = g_ceph_context->get_heartbeat_map()->add_worker("MDSRank", pthread_self());
 
   finisher = new Finisher(msgr->cct);
 
@@ -237,7 +238,11 @@ void MDSRankDispatcher::shutdown()
   progress_thread.shutdown();
 
   // shut down messenger
+  // release mds_lock first because messenger thread might call 
+  // MDSDaemon::ms_handle_reset which will try to hold mds_lock
+  mds_lock.Unlock();
   messenger->shutdown();
+  mds_lock.Lock();
 
   // Workaround unclean shutdown: HeartbeatMap will assert if
   // worker is not removed (as we do in ~MDS), but ~MDS is not
@@ -251,13 +256,13 @@ void MDSRankDispatcher::shutdown()
 /**
  * Helper for simple callbacks that call a void fn with no args.
  */
-class C_VoidFn : public MDSInternalContext
+class C_MDS_VoidFn : public MDSInternalContext
 {
   typedef void (MDSRank::*fn_ptr)();
   protected:
    fn_ptr fn;
   public:
-  C_VoidFn(MDSRank *mds_, fn_ptr fn_)
+  C_MDS_VoidFn(MDSRank *mds_, fn_ptr fn_)
     : MDSInternalContext(mds_), fn(fn_)
   {
     assert(mds_);
@@ -270,7 +275,7 @@ class C_VoidFn : public MDSInternalContext
   }
 };
 
-uint64_t MDSRank::get_metadata_pool()
+int64_t MDSRank::get_metadata_pool()
 {
     return mdsmap->get_metadata_pool();
 }
@@ -502,7 +507,8 @@ bool MDSRank::_dispatch(Message *m, bool new_msg)
     if (!dir->get_parent_dir()) continue;    // must be linked.
     if (!dir->is_auth()) continue;           // must be auth.
     frag_t fg = dir->get_frag();
-    if (fg == frag_t() || (rand() % (1 << fg.bits()) == 0))
+    if (mdsmap->allows_dirfrags() &&
+	(fg == frag_t() || (rand() % (1 << fg.bits()) == 0)))
       mdcache->split_dir(dir, 1);
     else
       balancer->queue_merge(dir);
@@ -661,7 +667,10 @@ void MDSRank::_advance_queues()
       old->put();
     } else {
       dout(7) << " processing laggy deferred " << *old << dendl;
-      handle_deferrable_message(old);
+      if (!handle_deferrable_message(old)) {
+        dout(0) << "unrecognized message " << *old << dendl;
+        old->put();
+      }
     }
 
     heartbeat_reset();
@@ -866,9 +875,6 @@ bool MDSRank::is_daemon_stopping() const
   return stopping;
 }
 
-// FIXME>> this fns are state-machiney, not dispatchy
-// >>>>>
-
 void MDSRank::request_state(MDSMap::DaemonState s)
 {
   dout(3) << "request_state " << ceph_mds_state_name(s) << dendl;
@@ -953,7 +959,7 @@ void MDSRank::boot_start(BootStep step, int r)
           mdcache->open_root_inode(gather.new_sub());
         } else {
           // replay.  make up fake root inode to start with
-          mdcache->create_root_inode();
+          (void)mdcache->create_root_inode();
         }
         gather.activate();
       }
@@ -1092,12 +1098,6 @@ void MDSRank::replay_done()
 {
   dout(1) << "replay_done" << (standby_replaying ? " (as standby)" : "") << dendl;
 
-  if (is_oneshot_replay()) {
-    dout(2) << "hack.  journal looks ok.  shutting down." << dendl;
-    suicide();
-    return;
-  }
-
   if (is_standby_replay()) {
     // The replay was done in standby state, and we are still in that state
     assert(standby_replaying);
@@ -1168,7 +1168,7 @@ void MDSRank::resolve_start()
 
   reopen_log();
 
-  mdcache->resolve_start(new C_VoidFn(this, &MDSRank::resolve_done));
+  mdcache->resolve_start(new C_MDS_VoidFn(this, &MDSRank::resolve_done));
   finish_contexts(g_ceph_context, waiting_for_resolve);
 }
 void MDSRank::resolve_done()
@@ -1185,7 +1185,7 @@ void MDSRank::reconnect_start()
     reopen_log();
   }
 
-  server->reconnect_clients(new C_VoidFn(this, &MDSRank::reconnect_done));
+  server->reconnect_clients(new C_MDS_VoidFn(this, &MDSRank::reconnect_done));
   finish_contexts(g_ceph_context, waiting_for_reconnect);
 }
 void MDSRank::reconnect_done()
@@ -1202,7 +1202,7 @@ void MDSRank::rejoin_joint_start()
 void MDSRank::rejoin_start()
 {
   dout(1) << "rejoin_start" << dendl;
-  mdcache->rejoin_start(new C_VoidFn(this, &MDSRank::rejoin_done));
+  mdcache->rejoin_start(new C_MDS_VoidFn(this, &MDSRank::rejoin_done));
 }
 void MDSRank::rejoin_done()
 {
@@ -1307,7 +1307,7 @@ void MDSRank::boot_create()
 {
   dout(3) << "boot_create" << dendl;
 
-  MDSGatherBuilder fin(g_ceph_context, new C_VoidFn(this, &MDSRank::creating_done));
+  MDSGatherBuilder fin(g_ceph_context, new C_MDS_VoidFn(this, &MDSRank::creating_done));
 
   mdcache->init_layouts();
 
@@ -1375,8 +1375,6 @@ void MDSRank::stopping_done()
   request_state(MDSMap::STATE_STOPPED);
 }
 
-// <<<<<<<<
-
 void MDSRankDispatcher::handle_mds_map(
     MMDSMap *m,
     MDSMap *oldmap)
@@ -1433,7 +1431,7 @@ void MDSRankDispatcher::handle_mds_map(
 
   if (oldstate != state) {
     // update messenger.
-    if (state == MDSMap::STATE_STANDBY_REPLAY || state == MDSMap::STATE_ONESHOT_REPLAY) {
+    if (state == MDSMap::STATE_STANDBY_REPLAY) {
       dout(1) << "handle_mds_map i am now mds." << mds_gid << "." << incarnation
 	      << " replaying mds." << whoami << "." << incarnation << dendl;
       messenger->set_myname(entity_name_t::MDS(mds_gid));
@@ -1666,27 +1664,19 @@ bool MDSRankDispatcher::handle_asok_command(
 {
   if (command == "dump_ops_in_flight" ||
              command == "ops") {
-    RWLock::RLocker l(op_tracker.lock);
-    if (!op_tracker.tracking_enabled) {
+    if (!op_tracker.dump_ops_in_flight(f)) {
       ss << "op_tracker tracking is not enabled now, so no ops are tracked currently, even those get stuck. \
 	  please enable \"osd_enable_op_tracker\", and the tracker will start to track new ops received afterwards.";
-    } else {
-      op_tracker.dump_ops_in_flight(f);
     }
   } else if (command == "dump_blocked_ops") {
-    if (!op_tracker.tracking_enabled) {
+    if (!op_tracker.dump_ops_in_flight(f, true)) {
       ss << "op_tracker tracking is not enabled now, so no ops are tracked currently, even those get stuck. \
 	Please enable \"osd_enable_op_tracker\", and the tracker will start to track new ops received afterwards.";
-    } else {
-      op_tracker.dump_ops_in_flight(f, true);
     }
   } else if (command == "dump_historic_ops") {
-    RWLock::RLocker l(op_tracker.lock);
-    if (!op_tracker.tracking_enabled) {
+    if (!op_tracker.dump_historic_ops(f)) {
       ss << "op_tracker tracking is not enabled now, so no ops are tracked currently, even those get stuck. \
 	  please enable \"osd_enable_op_tracker\", and the tracker will start to track new ops received afterwards.";
-    } else {
-      op_tracker.dump_historic_ops(f);
     }
   } else if (command == "osdmap barrier") {
     int64_t target_epoch = 0;
@@ -1708,13 +1698,11 @@ bool MDSRankDispatcher::handle_asok_command(
       cond.wait();
     }
   } else if (command == "session ls") {
-    mds_lock.Lock();
+    Mutex::Locker l(mds_lock);
 
     heartbeat_reset();
 
     dump_sessions(SessionFilter(), f);
-
-    mds_lock.Unlock();
   } else if (command == "session evict") {
     std::string client_id;
     const bool got_arg = cmd_getval(g_ceph_context, cmdmap, "client_id", client_id);
@@ -1766,6 +1754,7 @@ bool MDSRankDispatcher::handle_asok_command(
     }
     command_export_dir(f, path, (mds_rank_t)rank);
   } else if (command == "dump cache") {
+    Mutex::Locker l(mds_lock);
     string path;
     if(!cmd_getval(g_ceph_context, cmdmap, "path", path)) {
       mdcache->dump_cache(f);
@@ -1773,17 +1762,13 @@ bool MDSRankDispatcher::handle_asok_command(
       mdcache->dump_cache(path);
     }
   } else if (command == "force_readonly") {
-    mds_lock.Lock();
-    mdcache->force_readonly();
-    mds_lock.Unlock();
-  } else if (command == "dirfrag split") {
     Mutex::Locker l(mds_lock);
+    mdcache->force_readonly();
+  } else if (command == "dirfrag split") {
     command_dirfrag_split(cmdmap, ss);
   } else if (command == "dirfrag merge") {
-    Mutex::Locker l(mds_lock);
     command_dirfrag_merge(cmdmap, ss);
   } else if (command == "dirfrag ls") {
-    Mutex::Locker l(mds_lock);
     command_dirfrag_ls(cmdmap, ss, f);
   } else {
     return false;
@@ -2062,6 +2047,7 @@ int MDSRank::_command_flush_journal(std::stringstream *ss)
 void MDSRank::command_get_subtrees(Formatter *f)
 {
   assert(f != NULL);
+  Mutex::Locker l(mds_lock);
 
   std::list<CDir*> subtrees;
   mdcache->list_subtrees(subtrees);
@@ -2099,6 +2085,7 @@ int MDSRank::_command_export_dir(
     const std::string &path,
     mds_rank_t target)
 {
+  Mutex::Locker l(mds_lock);
   filepath fp(path.c_str());
 
   if (target == whoami || !mdsmap->is_up(target) || !mdsmap->is_in(target)) {
@@ -2174,6 +2161,12 @@ bool MDSRank::command_dirfrag_split(
     cmdmap_t cmdmap,
     std::ostream &ss)
 {
+  Mutex::Locker l(mds_lock);
+  if (!mdsmap->allows_dirfrags()) {
+    ss << "dirfrags are disallowed by the mds map!";
+    return false;
+  }
+
   int64_t by = 0;
   if (!cmd_getval(g_ceph_context, cmdmap, "bits", by)) {
     ss << "missing bits argument";
@@ -2199,6 +2192,7 @@ bool MDSRank::command_dirfrag_merge(
     cmdmap_t cmdmap,
     std::ostream &ss)
 {
+  Mutex::Locker l(mds_lock);
   std::string path;
   bool got = cmd_getval(g_ceph_context, cmdmap, "path", path);
   if (!got) {
@@ -2234,6 +2228,7 @@ bool MDSRank::command_dirfrag_ls(
     std::ostream &ss,
     Formatter *f)
 {
+  Mutex::Locker l(mds_lock);
   std::string path;
   bool got = cmd_getval(g_ceph_context, cmdmap, "path", path);
   if (!got) {
@@ -2390,13 +2385,17 @@ void MDSRank::create_logger()
 void MDSRank::check_ops_in_flight()
 {
   vector<string> warnings;
-  if (op_tracker.check_ops_in_flight(warnings)) {
+  int slow = 0;
+  if (op_tracker.check_ops_in_flight(warnings, &slow)) {
     for (vector<string>::iterator i = warnings.begin();
         i != warnings.end();
         ++i) {
       clog->warn() << *i;
     }
   }
+ 
+  // set mds slow request count 
+  mds_slow_req_count = slow;
   return;
 }
 
@@ -2475,25 +2474,27 @@ bool MDSRankDispatcher::handle_command_legacy(std::vector<std::string> args)
       dout(20) << "try_eval(" << inum << ", " << mask << ")" << dendl;
     } else dout(15) << "inode " << inum << " not in mdcache!" << dendl;
   } else if (args[0] == "fragment_dir") {
-    if (args.size() == 4) {
-      filepath fp(args[1].c_str());
-      CInode *in = mdcache->cache_traverse(fp);
-      if (in) {
-	frag_t fg;
-	if (fg.parse(args[2].c_str())) {
-	  CDir *dir = in->get_dirfrag(fg);
-	  if (dir) {
-	    if (dir->is_auth()) {
-	      int by = atoi(args[3].c_str());
-	      if (by)
-		mdcache->split_dir(dir, by);
-	      else
-		dout(0) << "need to split by >0 bits" << dendl;
-	    } else dout(0) << "dir " << dir->dirfrag() << " not auth" << dendl;
-	  } else dout(0) << "dir " << in->ino() << " " << fg << " dne" << dendl;
-	} else dout(0) << " frag " << args[2] << " does not parse" << dendl;
-      } else dout(0) << "path " << fp << " not found" << dendl;
-    } else dout(0) << "bad syntax" << dendl;
+    if (mdsmap->allows_dirfrags()) {
+      if (args.size() == 4) {
+	filepath fp(args[1].c_str());
+	CInode *in = mdcache->cache_traverse(fp);
+	if (in) {
+	  frag_t fg;
+	  if (fg.parse(args[2].c_str())) {
+	    CDir *dir = in->get_dirfrag(fg);
+	    if (dir) {
+	      if (dir->is_auth()) {
+		int by = atoi(args[3].c_str());
+		if (by)
+		  mdcache->split_dir(dir, by);
+		else
+		  dout(0) << "need to split by >0 bits" << dendl;
+	      } else dout(0) << "dir " << dir->dirfrag() << " not auth" << dendl;
+	    } else dout(0) << "dir " << in->ino() << " " << fg << " dne" << dendl;
+	  } else dout(0) << " frag " << args[2] << " does not parse" << dendl;
+	} else dout(0) << "path " << fp << " not found" << dendl;
+      } else dout(0) << "bad syntax" << dendl;
+    } else dout(0) << "dirfrags are disallowed by the mds map!" << dendl;
   } else if (args[0] == "merge_dir") {
     if (args.size() == 3) {
       filepath fp(args[1].c_str());

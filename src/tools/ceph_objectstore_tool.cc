@@ -442,23 +442,12 @@ int mark_pg_for_removal(ObjectStore *fs, spg_t pgid, ObjectStore::Transaction *t
     cerr << __func__ << " error on read_info " << cpp_strerror(r) << std::endl;
     return r;
   }
-  if (struct_v < 8) {
-    // old xattr
-    cout << "setting legacy 'remove' xattr flag" << std::endl;
-    bufferlist one;
-    one.append('1');
-    t->collection_setattr(coll, "remove", one);
-    cout << "remove " << coll_t::meta() << " " << log_oid << std::endl;
-    t->remove(coll_t::meta(), log_oid);
-    cout << "remove " << coll_t::meta() << " " << biginfo_oid << std::endl;
-    t->remove(coll_t::meta(), biginfo_oid);
-  } else {
-    // new omap key
-    cout << "setting '_remove' omap key" << std::endl;
-    map<string,bufferlist> values;
-    ::encode((char)1, values["_remove"]);
-    t->omap_setkeys(coll, pgmeta_oid, values);
-  }
+  assert(struct_v >= 8);
+  // new omap key
+  cout << "setting '_remove' omap key" << std::endl;
+  map<string,bufferlist> values;
+  ::encode((char)1, values["_remove"]);
+  t->omap_setkeys(coll, pgmeta_oid, values);
   return 0;
 }
 
@@ -1808,7 +1797,7 @@ struct do_fix_lost : public action_on_object_t {
         return 0;
       oi.clear_flag(object_info_t::FLAG_LOST);
       bufferlist bl;
-      ::encode(oi, bl);
+      ::encode(oi, bl, -1);  /* fixme: using full features */
       ObjectStore::Transaction t;
       t.setattr(coll, ghobj, OI_ATTR, bl);
       int r = store->apply_transaction(osr, std::move(t));
@@ -1980,7 +1969,7 @@ int set_size(ObjectStore *store, coll_t coll, ghobject_t &ghobj, uint64_t setsiz
   if (!dry_run) {
     attr.clear();
     oi.size = setsize;
-    ::encode(oi, attr);
+    ::encode(oi, attr, -1);  /* fixme: using full features */
     ObjectStore::Transaction t;
     t.setattr(coll, ghobj, OI_ATTR, attr);
     t.truncate(coll, ghobj, setsize);
@@ -2514,7 +2503,7 @@ int main(int argc, char **argv)
   bufferlist bl;
   OSDSuperblock superblock;
   bufferlist::iterator p;
-  ret = fs->read(coll_t::meta(), OSD_SUPERBLOCK_POBJECT, 0, 0, bl);
+  ret = fs->read(coll_t::meta(), OSD_SUPERBLOCK_GOBJECT, 0, 0, bl);
   if (ret < 0) {
     cerr << "Failure to read OSD superblock: " << cpp_strerror(ret) << std::endl;
     goto out;

@@ -3,9 +3,6 @@
 #include "librbd/ObjectMap.h"
 #include "librbd/ExclusiveLock.h"
 #include "librbd/ImageCtx.h"
-#include "librbd/ImageWatcher.h"
-#include "librbd/internal.h"
-#include "librbd/object_map/InvalidateRequest.h"
 #include "librbd/object_map/RefreshRequest.h"
 #include "librbd/object_map/ResizeRequest.h"
 #include "librbd/object_map/SnapshotCreateRequest.h"
@@ -17,8 +14,13 @@
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/WorkQueue.h"
-#include "include/stringify.h"
+
+#include "include/rados/librados.hpp"
+
 #include "cls/lock/cls_lock_client.h"
+#include "cls/rbd/cls_rbd_types.h"
+#include "include/stringify.h"
+#include "osdc/Striper.h"
 #include <sstream>
 
 #define dout_subsys ceph_subsys_rbd
@@ -46,6 +48,11 @@ std::string ObjectMap::object_map_name(const std::string &image_id,
     oid += snap_suffix.str();
   }
   return oid;
+}
+
+bool ObjectMap::is_compatible(const file_layout_t& layout, uint64_t size) {
+  uint64_t object_count = Striper::get_num_objects(layout, size);
+  return (object_count <= cls::rbd::MAX_OBJECT_MAP_OBJECT_COUNT);
 }
 
 ceph::BitVector<2u>::Reference ObjectMap::operator[](uint64_t object_no)

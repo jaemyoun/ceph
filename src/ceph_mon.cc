@@ -663,9 +663,8 @@ int main(int argc, const char **argv)
   // bind
   int rank = monmap.get_rank(g_conf->name.get_id());
   Messenger *msgr = Messenger::create(g_ceph_context, g_conf->ms_type,
-				      entity_name_t::MON(rank),
-				      "mon",
-				      0);
+				      entity_name_t::MON(rank), "mon",
+				      0, 0, Messenger::HAS_MANY_CONNECTIONS);
   if (!msgr)
     exit(1);
   msgr->set_cluster_protocol(CEPH_MON_PROTOCOL);
@@ -674,7 +673,7 @@ int main(int argc, const char **argv)
   uint64_t supported =
     CEPH_FEATURE_UID |
     CEPH_FEATURE_NOSRCADDR |
-    CEPH_FEATURE_MONCLOCKCHECK |
+    DEPRECATED_CEPH_FEATURE_MONCLOCKCHECK |
     CEPH_FEATURE_PGID64 |
     CEPH_FEATURE_MSG_AUTH;
   msgr->set_default_policy(Messenger::Policy::stateless_server(supported, 0));

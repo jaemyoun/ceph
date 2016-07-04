@@ -71,6 +71,8 @@ public:
 };
 
 class RGWCreateBucket_ObjStore_SWIFT : public RGWCreateBucket_ObjStore {
+protected:
+  bool need_metadata_upload() const override { return true; }
 public:
   RGWCreateBucket_ObjStore_SWIFT() {}
   ~RGWCreateBucket_ObjStore_SWIFT() {}
@@ -195,7 +197,7 @@ public:
   RGWHandler_REST_SWIFT() {}
   virtual ~RGWHandler_REST_SWIFT() {}
 
-  int validate_bucket_name(const string& bucket);
+  static int validate_bucket_name(const string& bucket);
 
   int init(RGWRados *store, struct req_state *s, RGWClientIO *cio);
   int authorize();

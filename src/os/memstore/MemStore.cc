@@ -220,17 +220,14 @@ int MemStore::mkfs()
   return 0;
 }
 
-int MemStore::statfs(struct statfs *st)
+int MemStore::statfs(struct store_statfs_t *st)
 {
-  dout(10) << __func__ << dendl;
-  st->f_bsize = 4096;
-
-  // Device size is a configured constant
-  st->f_blocks = g_conf->memstore_device_bytes / st->f_bsize;
-
-  dout(10) << __func__ << ": used_bytes: " << used_bytes << "/" << g_conf->memstore_device_bytes << dendl;
-  st->f_bfree = st->f_bavail = MAX((long(st->f_blocks) - long(used_bytes / st->f_bsize)), 0);
-
+   dout(10) << __func__ << dendl;
+  st->reset();
+  st->total = g_conf->memstore_device_bytes;
+  st->available = MAX(int64_t(st->total) - int64_t(used_bytes), 0ll);
+  dout(10) << __func__ << ": used_bytes: " << used_bytes
+	   << "/" << g_conf->memstore_device_bytes << dendl;
   return 0;
 }
 
@@ -1034,9 +1031,11 @@ int MemStore::_write(const coll_t& cid, const ghobject_t& oid,
     return -ENOENT;
 
   ObjectRef o = c->get_or_create_object(oid);
-  const ssize_t old_size = o->get_size();
-  o->write(offset, bl);
-  used_bytes += (o->get_size() - old_size);
+  if (len > 0) {
+    const ssize_t old_size = o->get_size();
+    o->write(offset, bl);
+    used_bytes += (o->get_size() - old_size);
+  }
 
   return 0;
 }
@@ -1354,15 +1353,8 @@ int MemStore::_collection_move_rename(const coll_t& oldcid, const ghobject_t& ol
     return -ENOENT;
 
   // note: c and oc may be the same
-  if (&(*c) == &(*oc)) {
-    c->lock.get_write();
-  } else if (&(*c) < &(*oc)) {
-    c->lock.get_write();
-    oc->lock.get_write();
-  } else if (&(*c) > &(*oc)) {
-    oc->lock.get_write();
-    c->lock.get_write();
-  }
+  assert(&(*c) == &(*oc));
+  c->lock.get_write();
 
   int r = -EEXIST;
   if (c->object_hash.count(oid))
@@ -1380,8 +1372,6 @@ int MemStore::_collection_move_rename(const coll_t& oldcid, const ghobject_t& ol
   r = 0;
  out:
   c->lock.put_write();
-  if (&(*c) != &(*oc))
-    oc->lock.put_write();
   return r;
 }
 

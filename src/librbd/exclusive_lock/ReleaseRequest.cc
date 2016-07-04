@@ -6,11 +6,8 @@
 #include "cls/lock/cls_lock_types.h"
 #include "common/dout.h"
 #include "common/errno.h"
-#include "common/WorkQueue.h"
-#include "include/stringify.h"
 #include "librbd/AioImageRequestWQ.h"
 #include "librbd/ExclusiveLock.h"
-#include "librbd/ImageCtx.h"
 #include "librbd/ImageWatcher.h"
 #include "librbd/Journal.h"
 #include "librbd/ObjectMap.h"
@@ -50,7 +47,29 @@ ReleaseRequest<I>::~ReleaseRequest() {
 
 template <typename I>
 void ReleaseRequest<I>::send() {
+  send_cancel_op_requests();
+}
+
+template <typename I>
+void ReleaseRequest<I>::send_cancel_op_requests() {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << __func__ << dendl;
+
+  using klass = ReleaseRequest<I>;
+  Context *ctx = create_context_callback<
+    klass, &klass::handle_cancel_op_requests>(this);
+  m_image_ctx.cancel_async_requests(ctx);
+}
+
+template <typename I>
+Context *ReleaseRequest<I>::handle_cancel_op_requests(int *ret_val) {
+  CephContext *cct = m_image_ctx.cct;
+  ldout(cct, 10) << __func__ << ": r=" << *ret_val << dendl;
+
+  assert(*ret_val == 0);
+
   send_block_writes();
+  return nullptr;
 }
 
 template <typename I>
@@ -79,34 +98,6 @@ Context *ReleaseRequest<I>::handle_block_writes(int *ret_val) {
   if (*ret_val < 0) {
     m_image_ctx.aio_work_queue->unblock_writes();
     return m_on_finish;
-  }
-
-  send_cancel_op_requests();
-  return nullptr;
-}
-
-template <typename I>
-void ReleaseRequest<I>::send_cancel_op_requests() {
-  CephContext *cct = m_image_ctx.cct;
-  ldout(cct, 10) << __func__ << dendl;
-
-  using klass = ReleaseRequest<I>;
-  Context *ctx = create_context_callback<
-    klass, &klass::handle_cancel_op_requests>(this);
-  m_image_ctx.cancel_async_requests(ctx);
-}
-
-template <typename I>
-Context *ReleaseRequest<I>::handle_cancel_op_requests(int *ret_val) {
-  CephContext *cct = m_image_ctx.cct;
-  ldout(cct, 10) << __func__ << ": r=" << *ret_val << dendl;
-
-  assert(*ret_val == 0);
-
-  if (m_on_releasing != nullptr) {
-    // alert caller that we no longer own the exclusive lock
-    m_on_releasing->complete(0);
-    m_on_releasing = nullptr;
   }
 
   send_flush_notifies();
@@ -210,6 +201,12 @@ template <typename I>
 void ReleaseRequest<I>::send_unlock() {
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 10) << __func__ << dendl;
+
+  if (m_on_releasing != nullptr) {
+    // alert caller that we no longer own the exclusive lock
+    m_on_releasing->complete(0);
+    m_on_releasing = nullptr;
+  }
 
   librados::ObjectWriteOperation op;
   rados::cls::lock::unlock(&op, RBD_LOCK_NAME, m_cookie);

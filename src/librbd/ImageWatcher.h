@@ -7,16 +7,13 @@
 #include "common/Mutex.h"
 #include "common/RWLock.h"
 #include "include/Context.h"
-#include "include/rados/librados.hpp"
 #include "include/rbd/librbd.hpp"
 #include "librbd/image_watcher/Notifier.h"
 #include "librbd/WatchNotifyTypes.h"
 #include <set>
 #include <string>
 #include <utility>
-#include <vector>
-#include <boost/function.hpp>
-#include "include/assert.h"
+#include <boost/variant.hpp>
 
 class entity_name_t;
 
@@ -34,24 +31,28 @@ public:
   void unregister_watch(Context *on_finish);
   void flush(Context *on_finish);
 
-  int notify_flatten(uint64_t request_id, ProgressContext &prog_ctx);
-  int notify_resize(uint64_t request_id, uint64_t size,
-                    ProgressContext &prog_ctx);
-  int notify_snap_create(const std::string &snap_name);
-  int notify_snap_rename(const snapid_t &src_snap_id,
-                         const std::string &dst_snap_name);
-  int notify_snap_remove(const std::string &snap_name);
-  int notify_snap_protect(const std::string &snap_name);
-  int notify_snap_unprotect(const std::string &snap_name);
-  int notify_rebuild_object_map(uint64_t request_id,
-                                ProgressContext &prog_ctx);
-  int notify_rename(const std::string &image_name);
+  void notify_flatten(uint64_t request_id, ProgressContext &prog_ctx,
+                      Context *on_finish);
+  void notify_resize(uint64_t request_id, uint64_t size,
+                     ProgressContext &prog_ctx, Context *on_finish);
+  void notify_snap_create(const std::string &snap_name, Context *on_finish);
+  void notify_snap_rename(const snapid_t &src_snap_id,
+                          const std::string &dst_snap_name,
+                          Context *on_finish);
+  void notify_snap_remove(const std::string &snap_name, Context *on_finish);
+  void notify_snap_protect(const std::string &snap_name, Context *on_finish);
+  void notify_snap_unprotect(const std::string &snap_name, Context *on_finish);
+  void notify_rebuild_object_map(uint64_t request_id,
+                                 ProgressContext &prog_ctx, Context *on_finish);
+  void notify_rename(const std::string &image_name, Context *on_finish);
 
   void notify_acquired_lock();
   void notify_released_lock();
   void notify_request_lock();
 
   void notify_header_update(Context *on_finish);
+  static void notify_header_update(librados::IoCtx &io_ctx,
+                                   const std::string &oid);
 
   uint64_t get_watch_handle() const {
     RWLock::RLocker watch_locker(m_watch_lock);
@@ -247,13 +248,14 @@ private:
   void handle_request_lock(int r);
   void schedule_request_lock(bool use_timer, int timer_delay = -1);
 
-  int notify_lock_owner(bufferlist &&bl);
   void notify_lock_owner(bufferlist &&bl, Context *on_finish);
 
+  Context *remove_async_request(const watch_notify::AsyncRequestId &id);
   void schedule_async_request_timed_out(const watch_notify::AsyncRequestId &id);
   void async_request_timed_out(const watch_notify::AsyncRequestId &id);
-  int notify_async_request(const watch_notify::AsyncRequestId &id,
-                           bufferlist &&in, ProgressContext& prog_ctx);
+  void notify_async_request(const watch_notify::AsyncRequestId &id,
+                            bufferlist &&in, ProgressContext& prog_ctx,
+                            Context *on_finish);
 
   void schedule_async_progress(const watch_notify::AsyncRequestId &id,
                                uint64_t offset, uint64_t total);

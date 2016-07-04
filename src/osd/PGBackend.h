@@ -18,8 +18,6 @@
 #ifndef PGBACKEND_H
 #define PGBACKEND_H
 
-#include "OSDMap.h"
-#include "PGLog.h"
 #include "osd_types.h"
 #include "common/WorkQueue.h"
 #include "include/Context.h"
@@ -31,6 +29,11 @@ namespace Scrub {
   class Store;
 }
 struct shard_info_wrapper;
+
+//forward declaration
+class OSDMap;
+class PGLog;
+typedef ceph::shared_ptr<const OSDMap> OSDMapRef;
 
  /**
   * PGBackend
@@ -215,7 +218,6 @@ struct shard_info_wrapper;
      virtual uint64_t min_peer_features() const = 0;
      virtual bool sort_bitwise() const = 0;
 
-     virtual bool transaction_use_tbl() = 0;
      virtual hobject_t get_temp_recovery_object(eversion_t version,
 						snapid_t snap) = 0;
 
@@ -401,7 +403,8 @@ struct shard_info_wrapper;
      virtual void set_alloc_hint(
        const hobject_t &hoid,
        uint64_t expected_object_size,
-       uint64_t expected_write_size
+       uint64_t expected_write_size,
+       uint32_t flags
        ) = 0;
 
      /// Optional, not supported on ec-pool
@@ -587,18 +590,15 @@ struct shard_info_wrapper;
      pg_shard_t auth_shard,
      const ScrubMap::object &auth,
      const object_info_t& auth_oi,
-     bool okseed,
      const ScrubMap::object &candidate,
      shard_info_wrapper& shard_error,
      ostream &errorstream);
    map<pg_shard_t, ScrubMap *>::const_iterator be_select_auth_object(
      const hobject_t &obj,
      const map<pg_shard_t,ScrubMap*> &maps,
-     bool okseed,
      object_info_t *auth_oi);
    void be_compare_scrubmaps(
      const map<pg_shard_t,ScrubMap*> &maps,
-     bool okseed,   ///< true if scrub digests have same seed our oi digests
      bool repair,
      map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &missing,
      map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &inconsistent,

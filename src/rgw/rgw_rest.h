@@ -14,6 +14,7 @@
 
 extern std::map<std::string, std::string> rgw_to_http_attrs;
 
+extern string camelcase_dash_http_attr(const string& orig);
 extern string lowercase_dash_http_attr(const string& orig);
 
 extern void rgw_rest_init(CephContext *cct, RGWRados *store, RGWZoneGroup& zone_group);
@@ -98,9 +99,10 @@ int rgw_rest_get_json_input_keep_data(CephContext *cct, req_state *s, T& out, in
   }
 
   try {
-      decode_json_obj(out, &parser);
+    decode_json_obj(out, &parser);
   } catch (JSONDecoder::err& e) {
-      return -EINVAL;
+    free(data);
+    return -EINVAL;
   }
 
   *pdata = data;
@@ -216,6 +218,8 @@ public:
   virtual int verify_params();
   virtual int get_params();
   virtual int get_data(bufferlist& bl);
+
+  int get_padding_last_aws4_chunk_encoded(bufferlist &bl, uint64_t chunk_size);
 };
 
 class RGWPostObj_ObjStore : public RGWPostObj
@@ -376,29 +380,21 @@ protected:
   virtual RGWOp *op_copy() { return NULL; }
   virtual RGWOp *op_options() { return NULL; }
 
-  virtual int validate_tenant_name(const string& bucket);
-  virtual int validate_bucket_name(const string& bucket);
-  virtual int validate_object_name(const string& object);
-
   static int allocate_formatter(struct req_state *s, int default_formatter,
 				bool configurable);
 public:
   RGWHandler_REST() {}
   virtual ~RGWHandler_REST() {}
 
+  static int validate_tenant_name(const string& bucket);
+  static int validate_bucket_name(const string& bucket);
+  static int validate_object_name(const string& object);
+
   int init_permissions(RGWOp* op);
   int read_permissions(RGWOp* op);
 
   virtual RGWOp* get_op(RGWRados* store);
   virtual void put_op(RGWOp* op);
-
-  virtual int retarget(RGWOp* op, RGWOp** new_op) {
-    *new_op = op;
-    return 0;
-  }
-
-  virtual int authorize() = 0;
-  // virtual int postauth_init(struct req_init_state *t) = 0;
 };
 
 class RGWHandler_REST_SWIFT;
@@ -484,16 +480,16 @@ extern void dump_string_header(struct req_state *s, const char *name,
 			       const char *val);
 extern void dump_content_length(struct req_state *s, uint64_t len);
 extern void dump_etag(struct req_state *s, const char *etag);
-extern void dump_epoch_header(struct req_state *s, const char *name, time_t t);
-extern void dump_time_header(struct req_state *s, const char *name, time_t t);
-extern void dump_last_modified(struct req_state *s, time_t t);
+extern void dump_epoch_header(struct req_state *s, const char *name, real_time t);
+extern void dump_time_header(struct req_state *s, const char *name, real_time t);
+extern void dump_last_modified(struct req_state *s, real_time t);
 extern void abort_early(struct req_state* s, RGWOp* op, int err,
 			RGWHandler* handler);
 extern void dump_range(struct req_state* s, uint64_t ofs, uint64_t end,
 		       uint64_t total_size);
 extern void dump_continue(struct req_state *s);
 extern void list_all_buckets_end(struct req_state *s);
-extern void dump_time(struct req_state *s, const char *name, time_t *t);
+extern void dump_time(struct req_state *s, const char *name, real_time *t);
 extern void dump_bucket_from_state(struct req_state *s);
 extern void dump_uri_from_state(struct req_state *s);
 extern void dump_redirect(struct req_state *s, const string& redirect);

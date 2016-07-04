@@ -120,6 +120,9 @@ class CephArgtype(object):
         """
         return '<{0}>'.format(self.__class__.__name__)
 
+    def complete(self, s):
+        return []
+
 
 class CephInt(CephArgtype):
     """
@@ -219,6 +222,12 @@ class CephString(CephArgtype):
             b += '(goodchars {0})'.format(self.goodchars)
         return '<string{0}>'.format(b)
 
+    def complete(self, s):
+        if s == '':
+            return []
+        else:
+            return [s]
+
 
 class CephSocketpath(CephArgtype):
     """
@@ -247,7 +256,7 @@ class CephIPAddr(CephArgtype):
             type = 4
         if type == 4:
             port = s.find(':')
-            if (port != -1):
+            if port != -1:
                 a = s[:port]
                 p = s[port + 1:]
                 if int(p) > 65535:
@@ -414,6 +423,8 @@ class CephOsdName(CephArgtype):
             i = int(i)
         except:
             raise ArgumentFormat('osd id ' + i + ' not integer')
+        if i < 0:
+            raise ArgumentFormat('osd id {0} is less than 0'.format(i))
         self.nametype = t
         self.nameid = i
         self.val = i
@@ -449,6 +460,10 @@ class CephChoices(CephArgtype):
             return '{0}'.format(self.strings[0])
         else:
             return '{0}'.format('|'.join(self.strings))
+
+    def complete(self, s):
+        all_elems = [token for token in self.strings if token.startswith(s)]
+        return all_elems
 
 
 class CephFilepath(CephArgtype):
@@ -527,7 +542,7 @@ class CephPrefix(CephArgtype):
                 self.val = s
                 return
         else:
-            if (s == self.prefix):
+            if s == self.prefix:
                 self.val = s
                 return
 
@@ -535,6 +550,12 @@ class CephPrefix(CephArgtype):
 
     def __str__(self):
         return self.prefix
+
+    def complete(self, s):
+        if self.prefix.startswith(s):
+            return [self.prefix.rstrip(' ')]
+        else:
+            return []
 
 
 class argdesc(object):
@@ -617,6 +638,9 @@ class argdesc(object):
         if not self.req:
             s = '{' + s + '}'
         return s
+
+    def complete(self, s):
+        return self.instance.complete(s)
 
 
 def concise_sig(sig):
@@ -958,7 +982,7 @@ def validate_command(sigdict, args, verbose=False):
         for cmdtag, cmd in sigdict.iteritems():
             sig = cmd['sig']
             matched = matchnum(args, sig, partial=True)
-            if (matched > best_match_cnt):
+            if matched > best_match_cnt:
                 if verbose:
                     print >> sys.stderr, \
                         "better match: {0} > {1}: {2}:{3} ".\
@@ -1271,4 +1295,3 @@ def json_command(cluster, target=('mon', ''), prefix=None, argdict=None,
             raise
 
     return ret, outbuf, outs
-

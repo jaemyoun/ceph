@@ -18,6 +18,7 @@
 #include <signal.h>
 #include <limits.h>
 #include <cstring>
+#include <boost/scope_exit.hpp>
 
 #include "Monitor.h"
 #include "common/version.h"
@@ -25,8 +26,6 @@
 #include "osd/OSDMap.h"
 
 #include "MonitorDBStore.h"
-
-#include "msg/Messenger.h"
 
 #include "messages/PaxosServiceMessage.h"
 #include "messages/MMonMap.h"
@@ -61,13 +60,12 @@
 #include "common/errno.h"
 #include "common/perf_counters.h"
 #include "common/admin_socket.h"
-
 #include "global/signal_handler.h"
-
+#include "common/Formatter.h"
+#include "include/stringify.h"
 #include "include/color.h"
 #include "include/ceph_fs.h"
 #include "include/str_list.h"
-#include "include/str_map.h"
 
 #include "OSDMonitor.h"
 #include "MDSMonitor.h"
@@ -78,13 +76,11 @@
 #include "mon/QuorumService.h"
 #include "mon/HealthMonitor.h"
 #include "mon/ConfigKeyService.h"
-
-#include "auth/AuthMethodList.h"
-#include "auth/KeyRing.h"
-
 #include "common/config.h"
 #include "common/cmdparse.h"
 #include "include/assert.h"
+#include "include/compat.h"
+#include "perfglue/heap_profiler.h"
 
 #define dout_subsys ceph_subsys_mon
 #undef dout_prefix
@@ -332,7 +328,7 @@ void Monitor::do_admin_command(string command, cmdmap_t& cmdmap, string format,
     elector.stop_participating();
     ss << "stopped responding to quorum, initiated new election";
   } else if (command == "ops") {
-    op_tracker.dump_ops_in_flight(f.get());
+    (void)op_tracker.dump_ops_in_flight(f.get());
     if (f) {
       f->flush(ss);
     }
@@ -463,6 +459,7 @@ const char** Monitor::get_tracked_conf_keys() const
     "clog_to_graylog",
     "clog_to_graylog_host",
     "clog_to_graylog_port",
+    "host",
     "fsid",
     // periodic health to clog
     "mon_health_to_clog",
@@ -1913,7 +1910,10 @@ void Monitor::win_election(epoch_t epoch, set<int>& active, uint64_t features,
     do_health_to_clog_interval();
     scrub_event_start();
   }
-  collect_sys_info(&metadata[rank], g_ceph_context);
+
+  Metadata my_meta;
+  collect_sys_info(&my_meta, g_ceph_context);
+  update_mon_metadata(rank, std::move(my_meta));
 }
 
 void Monitor::lose_election(epoch_t epoch, set<int> &q, int l, uint64_t features) 
@@ -2473,7 +2473,7 @@ void Monitor::get_cluster_status(stringstream &ss, Formatter *f)
     ss << "            election epoch " << get_epoch()
        << ", quorum " << get_quorum() << " " << get_quorum_names() << "\n";
     if (mdsmon()->fsmap.any_filesystems()) {
-      ss << "     mdsmap " << mdsmon()->fsmap << "\n";
+      ss << "      fsmap " << mdsmon()->fsmap << "\n";
     }
 
     osdmon()->osdmap.print_summary(NULL, ss);
@@ -2597,8 +2597,15 @@ void Monitor::handle_command(MonOpRequestRef op)
     return;
   }
 
-  MonSession *session = m->get_session();
-  assert(session);
+  MonSession *session = static_cast<MonSession *>(
+    m->get_connection()->get_priv());
+  if (!session) {
+    dout(5) << __func__ << " dropping stray message " << *m << dendl;
+    return;
+  }
+  BOOST_SCOPE_EXIT_ALL(=) {
+    session->put();
+  };
 
   if (m->cmd.empty()) {
     string rs = "No command supplied";
@@ -2624,7 +2631,19 @@ void Monitor::handle_command(MonOpRequestRef op)
     return;
   }
 
-  cmd_getval(g_ceph_context, cmdmap, "prefix", prefix);
+  // check return value. If no prefix parameter provided,
+  // return value will be false, then return error info.
+  if(!cmd_getval(g_ceph_context, cmdmap, "prefix", prefix)) {
+    reply_command(op, -EINVAL, "command prefix not found", 0);
+    return;
+  }
+
+  // check prefix is empty
+  if (prefix.empty()) {
+    reply_command(op, -EINVAL, "command prefix must not be empty", 0);
+    return;
+  }
+
   if (prefix == "get_command_descriptions") {
     bufferlist rdata;
     Formatter *f = Formatter::create("json");
@@ -2645,6 +2664,15 @@ void Monitor::handle_command(MonOpRequestRef op)
   boost::scoped_ptr<Formatter> f(Formatter::create(format));
 
   get_str_vec(prefix, fullcmd);
+
+  // make sure fullcmd is not empty.
+  // invalid prefix will cause empty vector fullcmd.
+  // such as, prefix=";,,;"
+  if (fullcmd.empty()) {
+    reply_command(op, -EINVAL, "command requires a prefix to be valid", 0);
+    return;
+  }
+
   module = fullcmd[0];
 
   // validate command is in leader map
@@ -2915,7 +2943,7 @@ void Monitor::handle_command(MonOpRequestRef op)
     f->flush(rdata);
 
     ostringstream ss2;
-    ss2 << "report " << rdata.crc32c(6789);
+    ss2 << "report " << rdata.crc32c(CEPH_MON_PORT);
     rs = ss2.str();
     r = 0;
   } else if (prefix == "node ls") {
@@ -2941,19 +2969,46 @@ void Monitor::handle_command(MonOpRequestRef op)
     rs = "";
     r = 0;
   } else if (prefix == "mon metadata") {
-    string name;
-    cmd_getval(g_ceph_context, cmdmap, "id", name);
-    int mon = monmap->get_rank(name);
-    if (mon < 0) {
-      rs = "requested mon not found";
-      r = -ENOENT;
-      goto out;
-    }
     if (!f)
       f.reset(Formatter::create("json-pretty"));
-    f->open_object_section("mon_metadata");
-    r = get_mon_metadata(mon, f.get(), ds);
-    f->close_section();
+
+    string name;
+    bool all = !cmd_getval(g_ceph_context, cmdmap, "id", name);
+    if (!all) {
+      // Dump a single mon's metadata
+      int mon = monmap->get_rank(name);
+      if (mon < 0) {
+        rs = "requested mon not found";
+        r = -ENOENT;
+        goto out;
+      }
+      f->open_object_section("mon_metadata");
+      r = get_mon_metadata(mon, f.get(), ds);
+      f->close_section();
+    } else {
+      // Dump all mons' metadata
+      r = 0;
+      f->open_array_section("mon_metadata");
+      for (unsigned int rank = 0; rank < monmap->size(); ++rank) {
+        std::ostringstream get_err;
+        f->open_object_section("mon");
+        f->dump_string("name", monmap->get_name(rank));
+        r = get_mon_metadata(rank, f.get(), get_err);
+        f->close_section();
+        if (r == -ENOENT || r == -EINVAL) {
+          dout(1) << get_err.str() << dendl;
+          // Drop error, list what metadata we do have
+          r = 0;
+        } else if (r != 0) {
+          derr << "Unexpected error from get_mon_metadata: "
+               << cpp_strerror(r) << dendl;
+          ds << get_err.str();
+          break;
+        }
+      }
+      f->close_section();
+    }
+
     f->flush(ds);
     rdata.append(ds);
     rs = "";
@@ -3254,19 +3309,11 @@ void Monitor::no_reply(MonOpRequestRef op)
   Message *req = op->get_req();
 
   if (session->proxy_con) {
-    if (get_quorum_features() & CEPH_FEATURE_MON_NULLROUTE) {
-      dout(10) << "no_reply to " << req->get_source_inst()
-	       << " via " << session->proxy_con->get_peer_addr()
-	       << " for request " << *req << dendl;
-      session->proxy_con->send_message(new MRoute(session->proxy_tid, NULL));
-      op->mark_event("no_reply: send routed request");
-    } else {
-      dout(10) << "no_reply no quorum nullroute feature for "
-               << req->get_source_inst()
-	       << " via " << session->proxy_con->get_peer_addr()
-	       << " for request " << *req << dendl;
-      op->mark_event("no_reply: no quorum support");
-    }
+    dout(10) << "no_reply to " << req->get_source_inst()
+	     << " via " << session->proxy_con->get_peer_addr()
+	     << " for request " << *req << dendl;
+    session->proxy_con->send_message(new MRoute(session->proxy_tid, NULL));
+    op->mark_event("no_reply: send routed request");
   } else {
     dout(10) << "no_reply to " << req->get_source_inst()
              << " " << *req << dendl;
@@ -3686,8 +3733,7 @@ void Monitor::dispatch_op(MonOpRequestRef op)
       {
         op->set_type_paxos();
         MMonPaxos *pm = static_cast<MMonPaxos*>(op->get_req());
-        if (!op->is_src_mon() ||
-            !op->get_session()->is_capable("mon", MON_CAP_X)) {
+        if (!op->get_session()->is_capable("mon", MON_CAP_X)) {
           //can't send these!
           break;
         }
@@ -3760,14 +3806,14 @@ void Monitor::handle_ping(MonOpRequestRef op)
   MPing *reply = new MPing;
   entity_inst_t inst = m->get_source_inst();
   bufferlist payload;
-  Formatter *f = new JSONFormatter(true);
+  boost::scoped_ptr<Formatter> f(new JSONFormatter(true));
   f->open_object_section("pong");
 
   list<string> health_str;
-  get_health(health_str, NULL, f);
+  get_health(health_str, NULL, f.get());
   {
     stringstream ss;
-    get_mon_status(f, ss);
+    get_mon_status(f.get(), ss);
   }
 
   f->close_section();
@@ -4246,7 +4292,7 @@ void Monitor::handle_subscribe(MonOpRequestRef op)
 			       p->second.flags & CEPH_SUBSCRIBE_ONETIME,
 			       m->get_connection()->has_feature(CEPH_FEATURE_INCSUBOSDMAP));
 
-    if (p->first.find("mdsmap") == 0 || p->first == "fsmap") {
+    if (p->first.compare(0, 6, "mdsmap") == 0 || p->first.compare(0, 5, "fsmap") == 0) {
       dout(10) << __func__ << ": MDS sub '" << p->first << "'" << dendl;
       if ((int)s->is_capable("mds", MON_CAP_R)) {
         Subscription *sub = s->sub_map[p->first];
@@ -4402,13 +4448,13 @@ void Monitor::handle_mon_metadata(MonOpRequestRef op)
   MMonMetadata *m = static_cast<MMonMetadata*>(op->get_req());
   if (is_leader()) {
     dout(10) << __func__ << dendl;
-    update_mon_metadata(m->get_source().num(), m->data);
+    update_mon_metadata(m->get_source().num(), std::move(m->data));
   }
 }
 
-void Monitor::update_mon_metadata(int from, const Metadata& m)
+void Monitor::update_mon_metadata(int from, Metadata&& m)
 {
-  metadata[from] = m;
+  pending_metadata.insert(make_pair(from, std::move(m)));
 
   bufferlist bl;
   int err = store->get(MONITOR_STORE_PREFIX, "last_metadata", bl);
@@ -4416,12 +4462,12 @@ void Monitor::update_mon_metadata(int from, const Metadata& m)
   if (!err) {
     bufferlist::iterator iter = bl.begin();
     ::decode(last_metadata, iter);
-    metadata.insert(last_metadata.begin(), last_metadata.end());
+    pending_metadata.insert(last_metadata.begin(), last_metadata.end());
   }
 
   MonitorDBStore::TransactionRef t = paxos->get_pending_transaction();
   bl.clear();
-  ::encode(metadata, bl);
+  ::encode(pending_metadata, bl);
   t->put(MONITOR_STORE_PREFIX, "last_metadata", bl);
   paxos->trigger_propose();
 }
@@ -4487,11 +4533,6 @@ int Monitor::scrub_start()
 {
   dout(10) << __func__ << dendl;
   assert(is_leader());
-
-  if ((get_quorum_features() & CEPH_FEATURE_MON_SCRUB) == 0) {
-    clog->warn() << "scrub not supported by entire quorum\n";
-    return -EOPNOTSUPP;
-  }
 
   if (!scrub_result.empty()) {
     clog->info() << "scrub already in progress\n";
@@ -5022,7 +5063,7 @@ int Monitor::write_default_keyring(bufferlist& bl)
   err = bl.write_fd(fd);
   if (!err)
     ::fsync(fd);
-  ::close(fd);
+  VOID_TEMP_FAILURE_RETRY(::close(fd));
 
   return err;
 }

@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [10.0.5], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [11.0.0], [ceph-devel@vger.kernel.org])
 
 AX_CXX_COMPILE_STDCXX_11(, mandatory)
 
@@ -17,7 +17,7 @@ RPM_RELEASE=0
 AC_SUBST(RPM_RELEASE)
 if test -d ".git" ; then
   AC_CHECK_PROG(GIT_CHECK, git, yes)
-  if test x"$GIT_CHECK" = x"yes"; then
+  if test x"$GIT_CHECK" = x"yes" -a x"$freebsd" != x"yes"; then
     RPM_RELEASE=`if expr index $(git describe --always) '-' > /dev/null ; then git describe --always | cut -d- -f2- | tr '-' '.' ; else echo "0"; fi`
   fi
 fi
@@ -47,7 +47,7 @@ m4_ifdef([AM_PROG_AR], [AM_PROG_AR])
 
 # Automake
 AM_PROG_CC_C_O
-AM_PROG_LIBTOOL
+LT_INIT([disable-static])
 AM_PROG_AS
 
 
@@ -63,6 +63,7 @@ darwin*)
 	;;
 linux*)
 	linux="yes"
+	CFLAGS="-D_LARGEFILE64_SOURCE ${CFLAGS}"
 	;;
 freebsd*)
 	freebsd="yes"
@@ -207,6 +208,13 @@ AC_ARG_ENABLE([server],
 AM_CONDITIONAL(ENABLE_SERVER, test "$enable_server" = "yes")
 #AS_IF([test "$enable_server" = "yes"], [AC_DEFINE([WITH_MON, WITH_OSD, WITH_MDS, ENABLE_SERVER])])
 
+# subscription manager?
+AC_ARG_ENABLE([subman],
+	[AS_HELP_STRING([--enable-subman], [enable subman])],
+	[],
+	[enable_subman=no])
+AM_CONDITIONAL([ENABLE_SUBMAN], test "x$enable_subman" != "xno")
+
 # cython is required to build python bindings for libraries
 if test x"$with_cython" = xyes; then
     AC_CHECK_PROG(CYTHON_CHECK, cython, yes)
@@ -236,7 +244,14 @@ AC_CHECK_PROG(YASM_CHECK, yasm, yes)
 if test x"$YASM_CHECK" = x"yes"; then
   if yasm -f elf64 src/common/crc32c_intel_fast_asm.S -o /dev/null; then
      echo 'we have a modern and working yasm'
-     if test `arch` = "x86_64" ; then
+     # FreeBSD has uname -p not arch(1), so do not exec arch
+     arch_x86_64=0
+     if test x`uname -p`x = x"amd64"x ; then
+	arch_x86_64=1
+     elif which arch 2>&1 > /dev/null; then 
+	test x`arch`x = x"x86_64"x  && arch_x86_64=1
+     fi
+     if test $arch_x86_64 -eq 1 ; then
         echo 'we are x86_64'
         arch_x32=0
         AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
@@ -383,13 +398,27 @@ AC_CHECK_LIB([m], [pow], [true], AC_MSG_FAILURE([libm not found]))
 AC_CHECK_FUNCS([syncfs], AC_DEFINE([HAVE_SYS_SYNCFS], [1], [we have syncfs]), [])
 
 # Find some crypto library for us to use, while letting user to decide which one to use.
-AC_ARG_WITH([cryptopp],
-	[AS_HELP_STRING([--with-cryptopp], [Use cryptographic functions from cryptopp])],
+AC_ARG_WITH([nss],
+	[AS_HELP_STRING([--with-nss], [Use cryptographic functions from nss])],
 	[],
-	[with_cryptopp=check])
-have_cryptopp=no
-# this looks clumsy but it's just if A then { success } else { if B then success }
-AS_IF([test "x$with_cryptopp" != "xno"],
+	[with_nss=check])
+have_nss=no
+AS_IF([test "x$with_nss" != "xno"],
+    [PKG_CHECK_MODULES([NSS], [nss], [have_nss=yes], [true])])
+# bail out if given explicit --with-nss
+if test "x$have_nss" = "xno" -a "x$with_nss" != "xcheck" -a "x$with_nss" != "xno"; then
+    AC_MSG_FAILURE([--with-nss was given, but library was not found])
+fi
+
+if test "x$have_nss" = "xno"; then
+  AC_ARG_WITH([cryptopp],
+    [AS_HELP_STRING([--with-cryptopp], [Use cryptographic functions from cryptopp])],
+    [],
+    [with_cryptopp=check])
+
+  have_cryptopp=no
+  # this looks clumsy but it's just if A then { success } else { if B then success }
+  AS_IF([test "x$with_cryptopp" != "xno"],
     [PKG_CHECK_MODULES([CRYPTOPP],
 	    [libcrypto++],
 	    [have_cryptopp=yes],
@@ -407,32 +436,14 @@ AS_IF([test "x$with_cryptopp" != "xno"],
 		   CXXFLAGS="${SAVED_CXXFLAGS}"
 		   AC_LANG_POP([C++])
 	   ])])
-# bail out if given explicit --with-cryptopp
-if test "x$have_cryptopp" = "xno" -a "x$with_cryptopp" != "xcheck" -a "x$with_cryptopp" != "xno"; then
+  # bail out if given explicit --with-cryptopp
+  if test "x$have_cryptopp" = "xno" -a "x$with_cryptopp" != "xcheck" -a "x$with_cryptopp" != "xno"; then
     AC_MSG_FAILURE([--with-cryptopp was given, but library was not found])
+  fi
 fi
 
-AC_ARG_WITH([nss],
-	[AS_HELP_STRING([--with-nss], [Use cryptographic functions from nss])],
-	[],
-	[with_nss=check])
-have_nss=no
-AS_IF([test "x$with_nss" != "xno"],
-    [PKG_CHECK_MODULES([NSS], [nss], [have_nss=yes], [true])])
-# bail out if given explicit --with-nss
-if test "x$have_nss" = "xno" -a "x$with_nss" != "xcheck" -a "x$with_nss" != "xno"; then
-    AC_MSG_FAILURE([--with-nss was given, but library was not found])
-fi
-
-# now decide which crypto library to really use
-if test "x$have_cryptopp" = "xyes"; then
-    AC_MSG_NOTICE([using cryptopp for cryptography])
-    AC_DEFINE([USE_CRYPTOPP], [1], [Define if using CryptoPP.])
-    AC_SUBST([CRYPTO_CFLAGS], [$CRYPTOPP_CFLAGS])
-    #AC_SUBST([CRYPTO_CXXFLAGS], [$CRYPTOPP_CXXFLAGS])
-    AM_CXXFLAGS="${AM_CXXFLAGS} ${CRYPTOPP_CXXFLAGS}"
-    AC_SUBST([CRYPTO_LIBS], [$CRYPTOPP_LIBS])
-elif test "x$have_nss" = "xyes"; then
+# now decide which crypto library to use
+if test "x$have_nss" = "xyes"; then
     AC_MSG_NOTICE([using nss for cryptography])
     AC_DEFINE([USE_NSS], [1], [Define if using NSS.])
     AC_SUBST([CRYPTO_CFLAGS], [$NSS_CFLAGS])
@@ -440,6 +451,19 @@ elif test "x$have_nss" = "xyes"; then
     #AC_SUBST([CRYPTO_CXXFLAGS], [$NSS_CFLAGS $NSS_CXXFLAGS])
     AM_CXXFLAGS="${AM_CXXFLAGS} ${NSS_CFLAGS} ${NSS_CXXFLAGS}"
     AC_SUBST([CRYPTO_LIBS], [$NSS_LIBS])
+    AC_SUBST([SSL_LIBS], [$NSS_LIBS])
+elif test "x$have_cryptopp" = "xyes"; then
+    AC_MSG_NOTICE([using cryptopp for cryptography])
+    AC_DEFINE([USE_CRYPTOPP], [1], [Define if using CryptoPP.])
+    AC_SUBST([CRYPTO_CFLAGS], [$CRYPTOPP_CFLAGS])
+    #AC_SUBST([CRYPTO_CXXFLAGS], [$CRYPTOPP_CXXFLAGS])
+    AM_CXXFLAGS="${AM_CXXFLAGS} ${CRYPTOPP_CXXFLAGS}"
+    AC_SUBST([CRYPTO_LIBS], [$CRYPTOPP_LIBS])
+    # OpenSSL -- defines OPENSSL_{INCLUDES,LIBS,LDFLAGS} on success
+    AX_CHECK_OPENSSL([],
+	[AC_MSG_FAILURE([CryptoPP build selected but OpenSSL not found])])
+    AC_SUBST([SSL_INCLUDES], [$OPENSSL_INCLUDES])
+    AC_SUBST([SSL_LIBS], [$OPENSSL_LIBS])
 else
     AC_MSG_FAILURE([no suitable crypto library found])
 fi
@@ -716,8 +740,6 @@ AM_CONDITIONAL(ENABLE_XIO, [test "x$enable_xio" = "xyes"])
 if test "x$enable_xio" = x"yes"; then
    AC_CHECK_HEADER([libxio.h], [], AC_MSG_ERROR([Cannot find header 'libxio.h'.]))
    AC_CHECK_LIB([xio], [xio_init], [], AC_MSG_FAILURE([Accelio libxio not found]))
-   AC_CHECK_LIB([ibverbs], [ibv_query_device], [], AC_MSG_FAILURE([libibverbs not found]))
-   AC_CHECK_LIB([rdmacm], [rdma_connect], [], AC_MSG_FAILURE([librdmacm not found]))
 
    # Also require boost-regex, used in address_helper
    AC_CHECK_LIB(boost_regex, main, [],
@@ -725,7 +747,7 @@ if test "x$enable_xio" = x"yes"; then
 
    AC_DEFINE([HAVE_XIO], [1], [Accelio conditional compilation])
 
-   XIO_LIBS="-lxio -libverbs -lrdmacm"
+   XIO_LIBS="-lxio"
    AC_SUBST(XIO_LIBS)
 fi
 
@@ -1279,6 +1301,33 @@ AS_IF([test "x$with_eventfd" != xno],
                      [AC_DEFINE(HAVE_EVENTFD, 1, [Have eventfd extension.])])])
 AM_CONDITIONAL(WITH_EVENTFD, [ test "$with_eventfd" = "yes" ])
 
+# disable OpenLDAP support
+AC_ARG_WITH([openldap],
+            [AS_HELP_STRING([--without-openldap], [Disable OpenLDAP support (RGW)])])
+if test "x$with_openldap" != "xno"; then
+   AC_CHECK_HEADER([ldap.h], [],
+      AC_MSG_ERROR([ldap.h not found (openldap-dev, openldap-devel)]))
+    AC_CHECK_LIB([ldap], [ldap_initialize], [true],
+      AC_MSG_FAILURE([libldap not found]))
+   AC_DEFINE([HAVE_OPENLDAP], [1], [Defined if OpenLDAP enabled])
+   have_openldap="yes"
+fi
+AM_CONDITIONAL(WITH_OPENLDAP, [ test "$have_openldap" = "yes" ])
+
+AC_ARG_WITH([reentrant-strsignal],
+            [AS_HELP_STRING([--with-reentrant-strsignal], [Use strsignal(3) instead of sys_siglist[]])],
+            [],
+            [with_reentrant_strsignal=no])
+AS_IF([test "x$with_reentrant_strsignal" != xno],
+  [AC_DEFINE(HAVE_REENTRANT_STRSIGNAL, 1, [Define if strsignal(3) is reentrant])])
+
+AC_ARG_WITH([thread-safe-res-query],
+            [AS_HELP_STRING([--with-thread-safe-res-query], [Use res_query(3) without locking])],
+            [],
+            [with_thread_safe_res_query=no])
+AS_IF([test "x$with_thread_safe_res_query" != xno],
+  [AC_DEFINE(HAVE_THREAD_SAFE_RES_QUERY, 1, [Define if res_query(3) is thread safe])])
+
 # Checks for typedefs, structures, and compiler characteristics.
 #AC_HEADER_STDBOOL
 #AC_C_CONST
@@ -1335,7 +1384,6 @@ AC_CONFIG_HEADERS([src/acconfig.h])
 AC_CONFIG_FILES([Makefile
 	src/Makefile
 	src/ocf/Makefile
-	src/ocf/ceph
 	src/ocf/rbd
 	src/java/Makefile
 	systemd/Makefile

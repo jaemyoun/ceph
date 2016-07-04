@@ -13,14 +13,48 @@
 #include "boost/intrusive/list.hpp"
 #include <boost/intrusive_ptr.hpp>
 
+class PerfCounters;
+
 class Allocator;
+
+enum {
+  l_bluefs_first = 732600,
+  l_bluefs_gift_bytes,
+  l_bluefs_reclaim_bytes,
+  l_bluefs_db_total_bytes,
+  l_bluefs_db_free_bytes,
+  l_bluefs_wal_total_bytes,
+  l_bluefs_wal_free_bytes,
+  l_bluefs_slow_total_bytes,
+  l_bluefs_slow_free_bytes,
+  l_bluefs_num_files,
+  l_bluefs_log_bytes,
+  l_bluefs_log_compactions,
+  l_bluefs_logged_bytes,
+  l_bluefs_files_written_wal,
+  l_bluefs_files_written_sst,
+  l_bluefs_bytes_written_wal,
+  l_bluefs_bytes_written_sst,
+  l_bluefs_last,
+};
 
 class BlueFS {
 public:
+  static constexpr unsigned MAX_BDEV = 3;
+  static constexpr unsigned BDEV_WAL = 0;
+  static constexpr unsigned BDEV_DB = 1;
+  static constexpr unsigned BDEV_SLOW = 2;
+
+  enum {
+    WRITER_UNKNOWN,
+    WRITER_WAL,
+    WRITER_SST,
+  };
+
   struct File : public RefCountedObject {
     bluefs_fnode_t fnode;
     int refs;
-    bool dirty;
+    uint64_t dirty_seq;
     bool locked;
     bool deleted;
     boost::intrusive::list_member_hook<> dirty_item;
@@ -31,7 +65,7 @@ public:
     File()
       : RefCountedObject(NULL, 0),
 	refs(0),
-	dirty(false),
+	dirty_seq(0),
 	locked(false),
 	deleted(false),
 	num_readers(0),
@@ -78,24 +112,20 @@ public:
     uint64_t pos;           ///< start offset for buffer
     bufferlist buffer;      ///< new data to write (at end of file)
     bufferlist tail_block;  ///< existing partial block at end of file, if any
+    int writer_type = 0;    ///< WRITER_*
 
     std::mutex lock;
-    vector<IOContext*> iocv;  ///< one for each bdev
+    std::array<IOContext*,MAX_BDEV> iocv; ///< for each bdev
 
-    FileWriter(FileRef f, unsigned num_bdev)
+    FileWriter(FileRef f)
       : file(f),
 	pos(0) {
       ++file->num_writers;
-      iocv.resize(num_bdev);
-      for (unsigned i = 0; i < num_bdev; ++i) {
-	iocv[i] = new IOContext(NULL);
-      }
     }
+    // NOTE: caller must call BlueFS::close_writer()
     ~FileWriter() {
       --file->num_writers;
-      assert(iocv.empty());  // caller must call BlueFS::close_writer()
     }
-
     void append(const char *buf, size_t len) {
       buffer.append(buf, len);
     }
@@ -161,6 +191,8 @@ public:
 private:
   std::mutex lock;
 
+  PerfCounters *logger;
+
   // cache
   map<string, DirRef> dir_map;                    ///< dirname -> Dir
   ceph::unordered_map<uint64_t,FileRef> file_map; ///< ino -> File
@@ -169,28 +201,28 @@ private:
   bluefs_super_t super;       ///< latest superblock (as last written)
   uint64_t ino_last;          ///< last assigned ino (this one is in use)
   uint64_t log_seq;           ///< last used log seq (by current pending log_t)
+  uint64_t log_seq_stable;    ///< last stable/synced log seq
   FileWriter *log_writer;     ///< writer for the log
   bluefs_transaction_t log_t; ///< pending, unwritten log transaction
+  bool log_flushing = false;  ///< true while flushing the log
+  std::condition_variable log_cond;
 
   /*
-   * - there can be from 1 to 3 block devices.
+   * There are up to 3 block devices:
    *
-   * - the first device always has the superblock.
-   *
-   * - if there is a dedicated db device, it is the first device, and the
-   *   second device is shared with bluestore.  the first device will be
-   *   db/, and the second device will be db.slow/.
-   *
-   * - if there is no dedicated db device, then the first device is shared, and
-   *   maps to the db/ directory.
-   *
-   * - a wal device, if present, it always the last device.  it should be
-   *   used for any files in the db.wal/ directory.
+   *  BDEV_DB   db/      - the primary db device
+   *  BDEV_WAL  db.wal/  - a small, fast device, specifically for the WAL
+   *  BDEV_SLOW db.slow/ - a big, slow device, to spill over to as BDEV_DB fills
    */
   vector<BlockDevice*> bdev;                  ///< block devices we can use
   vector<IOContext*> ioc;                     ///< IOContexts for bdevs
   vector<interval_set<uint64_t> > block_all;  ///< extents in bdev we own
+  vector<uint64_t> block_total;               ///< sum of block_all
   vector<Allocator*> alloc;                   ///< allocators for bdevs
+
+  void _init_logger();
+  void _shutdown_logger();
+  void _update_logger_stats();
 
   void _init_alloc();
   void _stop_alloc();
@@ -203,17 +235,18 @@ private:
   int _allocate(unsigned bdev, uint64_t len, vector<bluefs_extent_t> *ev);
   int _flush_range(FileWriter *h, uint64_t offset, uint64_t length);
   int _flush(FileWriter *h, bool force);
-  void _flush_wait(FileWriter *h);
-  void _fsync(FileWriter *h);
+  void wait_for_aio(FileWriter *h);  // safe to call without a lock
+  int _fsync(FileWriter *h, std::unique_lock<std::mutex>& l);
 
-  int _flush_log();
+  int _flush_and_sync_log(std::unique_lock<std::mutex>& l,
+			  uint64_t want_seq = 0);
   uint64_t _estimate_log_size();
   void _maybe_compact_log();
   void _compact_log();
 
   //void _aio_finish(void *priv);
 
-  void _flush_bdev();
+  void flush_bdev();  // this is safe to call without a lock
 
   int _preallocate(FileRef f, uint64_t off, uint64_t len);
   int _truncate(FileWriter *h, uint64_t off);
@@ -237,6 +270,7 @@ private:
   int _write_super();
   int _replay(); ///< replay journal
 
+  FileWriter *_create_writer(FileRef f);
   void _close_writer(FileWriter *h);
 
   // always put the super in the second 4k block.  FIXME should this be
@@ -325,9 +359,9 @@ public:
     std::lock_guard<std::mutex> l(lock);
     _flush_range(h, offset, length);
   }
-  void fsync(FileWriter *h) {
-    std::lock_guard<std::mutex> l(lock);
-    _fsync(h);
+  int fsync(FileWriter *h) {
+    std::unique_lock<std::mutex> l(lock);
+    return _fsync(h, l);
   }
   int read(FileReader *h, FileReaderBuffer *buf, uint64_t offset, size_t len,
 	   bufferlist *outbl, char *out) {
