@@ -27,7 +27,6 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 
 	cerr << "jae: ceph_str_hash_rjenkins::str = " << str << std::endl;
 	cerr << "jae: ceph_str_hash_rjenkins::length = " << length << std::endl;
-	return 1;
 	/* Set up the internal state */
 	len = length;
 	a = 0x9e3779b9;      /* the golden ratio; an arbitrary value */
@@ -109,6 +108,8 @@ unsigned ceph_str_hash(int type, const char *s, unsigned len)
 	case CEPH_STR_HASH_RJENKINS:
 		cerr << "jae: ceph_str_hash::CEPH_STR_HASH_RJENKINS" << std::endl;
 		return ceph_str_hash_rjenkins(s, len);
+	case CEPH_STR_HASH_BINGO:
+		return 1;
 	default:
 		return -1;
 	}
