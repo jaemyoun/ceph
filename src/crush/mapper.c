@@ -823,6 +823,8 @@ int crush_do_rule(const struct crush_map *map,
 	int vary_r = map->chooseleaf_vary_r;
 	int stable = map->chooseleaf_stable;
 
+	printf("jae: crush_do_rule\n");
+
 	if ((__u32)ruleno >= map->max_rules) {
 		dprintk(" bad ruleno %d\n", ruleno);
 		return 0;

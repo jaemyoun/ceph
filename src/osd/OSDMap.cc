@@ -1469,6 +1469,7 @@ int OSDMap::object_locator_to_pg(
 	const object_locator_t& loc,
 	pg_t &pg) const
 {
+  cerr << "jae: OSDMAP::object_locator_to_pg" << std::endl;
   // calculate ps (placement seed)
   const pg_pool_t *pool = get_pg_pool(loc.get_pool());
   if (!pool)
@@ -1480,7 +1481,12 @@ int OSDMap::object_locator_to_pg(
     if (!loc.key.empty())
       ps = pool->hash_key(loc.key, loc.nspace);
     else
+    {
       ps = pool->hash_key(oid.name, loc.nspace);
+      cerr << "jae: OSDMAP::object_locator_to_pg::oid.name = " << oid.name << std::endl;
+      cerr << "jae: OSDMAP::object_locator_to_pg::loc.nspace = " << loc.nspace << std::endl;
+      cerr << "jae: OSDMAP::object_locator_to_pg::ps = " << ps << std::endl;
+    }
   }
   pg = pg_t(ps, loc.get_pool(), -1);
   return 0;
@@ -1489,6 +1495,7 @@ int OSDMap::object_locator_to_pg(
 ceph_object_layout OSDMap::make_object_layout(
   object_t oid, int pg_pool, string nspace) const
 {
+  cerr << "jae: OSDMap::make_object_layout" << std::endl;
   object_locator_t loc(pg_pool, nspace);
 
   ceph_object_layout ol;

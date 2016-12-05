@@ -1,0 +1,43 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "C++ Launch",
+      "type": "cppdbg",
+      "request": "launch",
+      // "program": "enter program name, for example ${workspaceRoot}/a.out",
+      "program": "${workspaceRoot}/src/.libs/rados",
+      "args": ["put", "A", "${workspaceRoot}/NEWS", "-p=rbd"],
+      // "args": ["ls", "-p=rbd"],
+      "stopAtEntry": false,
+      "cwd": "${workspaceRoot}",
+      "environment": [],
+      "externalConsole": true,
+      "linux": {
+        "MIMode": "gdb"
+      },
+      "osx": {
+        "MIMode": "lldb"
+      },
+      "windows": {
+        "MIMode": "gdb"
+      }
+    },
+    {
+      "name": "C++ Attach",
+      "type": "cppdbg",
+      "request": "attach",
+      "program": "enter program name, for example ${workspaceRoot}/a.out",
+      "processId": "${command.pickProcess}",
+      "linux": {
+        "MIMode": "gdb"
+      },
+      "osx": {
+        "MIMode": "lldb"
+      },
+      "windows": {
+        "MIMode": "gdb"
+      }
+    }
+  ]
+}

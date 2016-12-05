@@ -1181,6 +1181,7 @@ int librados::IoCtx::append(const std::string& oid, bufferlist& bl, size_t len)
 int librados::IoCtx::write_full(const std::string& oid, bufferlist& bl)
 {
   object_t obj(oid);
+  cerr << "jae: librados::IoCtx::write_full()" << std::endl;
   return io_ctx_impl->write_full(obj, bl);
 }
 

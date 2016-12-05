@@ -42,6 +42,7 @@ static __u32 crush_hash32_rjenkins1_2(__u32 a, __u32 b)
 	crush_hashmix(a, b, hash);
 	crush_hashmix(x, a, hash);
 	crush_hashmix(b, y, hash);
+	printf("jae: crush_hash32_rjenkins1_2::hash = %d\n", hash);
 	return hash;
 }
 
@@ -102,6 +103,7 @@ __u32 crush_hash32(int type, __u32 a)
 
 __u32 crush_hash32_2(int type, __u32 a, __u32 b)
 {
+	printf("jae: crush_hash32_2::a(mod) = %d\n", a);
 	switch (type) {
 	case CRUSH_HASH_RJENKINS1:
 		return crush_hash32_rjenkins1_2(a, b);

@@ -25,6 +25,9 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 	__u32 a, b, c;  /* the internal state */
 	__u32 len;      /* how many key bytes still need mixing */
 
+	cerr << "jae: ceph_str_hash_rjenkins::str = " << str << std::endl;
+	cerr << "jae: ceph_str_hash_rjenkins::length = " << length << std::endl;
+	return 1;
 	/* Set up the internal state */
 	len = length;
 	a = 0x9e3779b9;      /* the golden ratio; an arbitrary value */
@@ -74,6 +77,7 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 	}
 	mix(a, b, c);
 
+	cerr << "jae: ceph_str_hash_rjenkins::c = " << c << std::endl;
 	return c;
 }
 
@@ -83,11 +87,15 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 unsigned ceph_str_hash_linux(const char *str, unsigned length)
 {
 	unsigned long hash = 0;
+	cerr << "jae: ceph_str_hash_linux::str = " << str << std::endl;
+	cerr << "jae: ceph_str_hash_linux::length = " << length << std::endl;
 
 	while (length--) {
 		unsigned char c = *str++;
 		hash = (hash + (c << 4) + (c >> 4)) * 11;
 	}
+
+	cerr << "jae: ceph_str_hash_linux::hash = " << hash << std::endl;
 	return hash;
 }
 
@@ -96,8 +104,10 @@ unsigned ceph_str_hash(int type, const char *s, unsigned len)
 {
 	switch (type) {
 	case CEPH_STR_HASH_LINUX:
+		cerr << "jae: ceph_str_hash::CEPH_STR_HASH_LINUX" << std::endl;
 		return ceph_str_hash_linux(s, len);
 	case CEPH_STR_HASH_RJENKINS:
+		cerr << "jae: ceph_str_hash::CEPH_STR_HASH_RJENKINS" << std::endl;
 		return ceph_str_hash_rjenkins(s, len);
 	default:
 		return -1;

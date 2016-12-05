@@ -1325,6 +1325,7 @@ SnapContext pg_pool_t::get_snap_context() const
 
 uint32_t pg_pool_t::hash_key(const string& key, const string& ns) const
 {
+  cerr << "jae: pg_pool_t::hash_key::ns.empty() = " << ns.empty() << std::endl;
  if (ns.empty()) 
     return ceph_str_hash(object_hash, key.data(), key.length());
   int nsl = ns.length();

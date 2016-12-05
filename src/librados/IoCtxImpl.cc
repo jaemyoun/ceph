@@ -640,6 +640,7 @@ int librados::IoCtxImpl::write_full(const object_t& oid, bufferlist& bl)
     return -E2BIG;
   ::ObjectOperation op;
   prepare_assert_ops(&op);
+  cerr << "jae: librados::IoCtxImpl::write_full()" << std::endl;
   op.write_full(bl);
   return operate(oid, &op, NULL);
 }
