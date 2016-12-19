@@ -125,6 +125,9 @@ libcommon_internal_la_SOURCES += \
 	mds/mdstypes.cc \
 	mds/flock.cc
 
+libcommon_internal_la_CXXFLAGS = -I rocksdb/include -fPIC
+libcommon_internal_la_LIBADD = rocksdb/librocksdb.a
+
 LIBCOMMON_DEPS += libcommon_internal.la
 noinst_LTLIBRARIES += libcommon_internal.la
 
@@ -173,7 +176,6 @@ if LINUX
 LIBCOMMON_DEPS += -lrt -lblkid
 endif # LINUX
 
-libcommon_la_CXXFLAGS = -I rocksdb/include
 libcommon_la_SOURCES = common/buffer.cc
 libcommon_la_LIBADD = $(LIBCOMMON_DEPS)
 noinst_LTLIBRARIES += libcommon.la
