@@ -3,6 +3,7 @@
 
 #define CEPH_STR_HASH_LINUX      0x1  /* linux dcache hash */
 #define CEPH_STR_HASH_RJENKINS   0x2  /* robert jenkins' */
+#define CEPH_STR_HASH_BINGO      0x3  /* bingo hash */
 
 extern unsigned ceph_str_hash_linux(const char *s, unsigned len);
 extern unsigned ceph_str_hash_rjenkins(const char *s, unsigned len);

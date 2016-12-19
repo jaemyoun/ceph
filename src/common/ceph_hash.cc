@@ -83,36 +83,46 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 /*
  * hash function for bingo by jae
  */
+#include "rocksdb/db.h"
 unsigned ceph_str_hash_bingo(const char *str, unsigned length)
 {
 	const unsigned char *k = (const unsigned char *)str;
-	__u32 a, b, c;  /* the internal state */
-	__u32 len;      /* how many key bytes still need mixing */
 
-	/* Set up the internal state */
-	len = length;
-	a = 0x9e3779b9;      /* the golden ratio; an arbitrary value */
-	b = a;
-	c = 0;               /* variable initialization of internal state */
+	rocksdb::DB* db;
+	rocksdb::Options options;
+	options.create_if_missing = true;
+	rocksdb::Status status = rocksdb::DB::Open(options, "/var/lib/ceph/bingo.map", &db);
+	cerr << "jae: status.ok = " << status.ok() << std::endl;
 
-  std::string line;
-  ifstream bingomap ("/var/lib/ceph/bingo.map");
-  if (bingomap.is_open())
-  {
-		if(getline(bingomap, line)) {
-  		cerr << line << '\n' << std::endl;
-    	bingomap.close();
-			return stoi(line);
-		} else {
-			return 1;
-		}
-  }
-	else {
-  	cerr << "Unable to open file" << std::endl; 
-		return 1;
-	}
+	return 1;
 
-	return c;
+	// __u32 a, b, c;  /* the internal state */
+	// __u32 len;      /* how many key bytes still need mixing */
+
+	// /* Set up the internal state */
+	// len = length;
+	// a = 0x9e3779b9;      /* the golden ratio; an arbitrary value */
+	// b = a;
+	// c = 0;               /* variable initialization of internal state */
+
+  // std::string line;
+  // ifstream bingomap ("/var/lib/ceph/bingo.map");
+  // if (bingomap.is_open())
+  // {
+	// 	if(getline(bingomap, line)) {
+  // 		cerr << "jae: ceph_str_hash_bingo: wanted pg = " << line << '\n' << std::endl;
+  //   	bingomap.close();
+	// 		return stoi(line);
+	// 	} else {
+	// 		return 1;
+	// 	}
+  // }
+	// else {
+  // 	cerr << "jae: ceph_str_hash_bingo: Unable to open file" << std::endl; 
+	// 	return 1;
+	// }
+
+	// return c;
 }
 
 /*
@@ -136,7 +146,8 @@ unsigned ceph_str_hash(int type, const char *s, unsigned len)
 	case CEPH_STR_HASH_LINUX:
 		return ceph_str_hash_linux(s, len);
 	case CEPH_STR_HASH_RJENKINS:
-		// return ceph_str_hash_rjenkins(s, len);
+		return ceph_str_hash_rjenkins(s, len);
+	case CEPH_STR_HASH_BINGO:
 		return ceph_str_hash_bingo(s, len);
 	default:
 		return -1;
@@ -150,6 +161,8 @@ const char *ceph_str_hash_name(int type)
 		return "linux";
 	case CEPH_STR_HASH_RJENKINS:
 		return "rjenkins";
+	case CEPH_STR_HASH_BINGO:
+		return "bingo";
 	default:
 		return "unknown";
 	}

@@ -173,6 +173,7 @@ if LINUX
 LIBCOMMON_DEPS += -lrt -lblkid
 endif # LINUX
 
+libcommon_la_CXXFLAGS = -I rocksdb/include
 libcommon_la_SOURCES = common/buffer.cc
 libcommon_la_LIBADD = $(LIBCOMMON_DEPS)
 noinst_LTLIBRARIES += libcommon.la
