@@ -126,7 +126,7 @@ libcommon_internal_la_SOURCES += \
 	mds/flock.cc
 
 libcommon_internal_la_CXXFLAGS = -I rocksdb/include -fPIC
-libcommon_internal_la_LIBADD = rocksdb/librocksdb.a
+libcommon_internal_la_LIBADD = -lrocksdb
 
 LIBCOMMON_DEPS += libcommon_internal.la
 noinst_LTLIBRARIES += libcommon_internal.la
