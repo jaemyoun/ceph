@@ -83,46 +83,47 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
 /*
  * hash function for bingo by jae
  */
+#include <cstdlib>
 #include "rocksdb/db.h"
 unsigned ceph_str_hash_bingo(const char *str, unsigned length)
 {
-	const unsigned char *k = (const unsigned char *)str;
-
+	std::cerr << "jae: ceph_str_hash_bingo: start" << std::endl;
 	rocksdb::DB* db;
 	rocksdb::Options options;
+	
+	std::string keywanted = "wantedpg";
+	std::string oid(str);
+	std::string value;
+	std::string rocksdbPath(std::getenv("HOME"));
+	rocksdbPath += "/.bingo-hashmap";
+	
+	std::cerr << "jae: ceph_str_hash_bingo: defined variables" << std::endl;
 	options.create_if_missing = true;
-	rocksdb::Status status = rocksdb::DB::Open(options, "/var/lib/ceph/bingo.map", &db);
-	cerr << "jae: status.ok = " << status.ok() << std::endl;
+	rocksdb::Status status = rocksdb::DB::Open(options, rocksdbPath, &db);
+	assert(status.ok());
 
-	return 1;
+	std::cerr << "jae: ceph_str_hash_bingo: status.ok" << std::endl;
+	// read the pg num (value) of oid (key)
+	status = db->Get(rocksdb::ReadOptions(), oid, &value);
+	if (status.ok()) {
+		delete db;
+		std::cerr << "jae: ceph_str_hash_bingo: get existed value = " << value << std::endl;
+		return stoi(value);
+	}
 
-	// __u32 a, b, c;  /* the internal state */
-	// __u32 len;      /* how many key bytes still need mixing */
+	std::cerr << "jae: ceph_str_hash_bingo: no exist the oid" << std::endl;
+	// if no exist, allocate the pg num which GELU wantted.
+	status = db->Get(rocksdb::ReadOptions(), keywanted, &value);
+	if (!status.ok()) {
+		db->Put(rocksdb::WriteOptions(), keywanted, "1");
+		status = db->Get(rocksdb::ReadOptions(), keywanted, &value);
+		assert(status.ok());
+	}
+	status = db->Put(rocksdb::WriteOptions(), oid, value);
+	std::cerr << "jae: ceph_str_hash_bingo: created KV(oid,pg)" << std::endl;
 
-	// /* Set up the internal state */
-	// len = length;
-	// a = 0x9e3779b9;      /* the golden ratio; an arbitrary value */
-	// b = a;
-	// c = 0;               /* variable initialization of internal state */
-
-  // std::string line;
-  // ifstream bingomap ("/var/lib/ceph/bingo.map");
-  // if (bingomap.is_open())
-  // {
-	// 	if(getline(bingomap, line)) {
-  // 		cerr << "jae: ceph_str_hash_bingo: wanted pg = " << line << '\n' << std::endl;
-  //   	bingomap.close();
-	// 		return stoi(line);
-	// 	} else {
-	// 		return 1;
-	// 	}
-  // }
-	// else {
-  // 	cerr << "jae: ceph_str_hash_bingo: Unable to open file" << std::endl; 
-	// 	return 1;
-	// }
-
-	// return c;
+	delete db;
+	return stoi(value);
 }
 
 /*
@@ -142,13 +143,18 @@ unsigned ceph_str_hash_linux(const char *str, unsigned length)
 
 unsigned ceph_str_hash(int type, const char *s, unsigned len)
 {
+	unsigned int rtn;
 	switch (type) {
 	case CEPH_STR_HASH_LINUX:
 		return ceph_str_hash_linux(s, len);
 	case CEPH_STR_HASH_RJENKINS:
-		return ceph_str_hash_rjenkins(s, len);
+		rtn =  ceph_str_hash_rjenkins(s, len);
+		std::cerr << "jae: ceph_str_hash: rtn = " << rtn << std::endl;
+		return rtn;
 	case CEPH_STR_HASH_BINGO:
-		return ceph_str_hash_bingo(s, len);
+		rtn = ceph_str_hash_bingo(s, len);
+		std::cerr << "jae: ceph_str_hash: rtn = " << rtn << std::endl;
+		return rtn;
 	default:
 		return -1;
 	}
