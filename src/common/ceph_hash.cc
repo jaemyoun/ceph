@@ -84,6 +84,7 @@ unsigned ceph_str_hash_rjenkins(const char *str, unsigned length)
  * hash function for bingo by jae
  */
 #include <cstdlib>
+#include <sstream>
 #include "rocksdb/db.h"
 unsigned ceph_str_hash_bingo(const char *str, unsigned length)
 {
@@ -94,19 +95,27 @@ unsigned ceph_str_hash_bingo(const char *str, unsigned length)
 	std::string keywanted = "wantedpg";
 	std::string oid(str);
 	std::string value;
-	std::string rocksdbPath(std::getenv("HOME"));
-	rocksdbPath += "/.bingo-hashmap";
+	// std::string rocksdbPath(std::getenv("HOME"));
+	// rocksdbPath += "/.bingo-hashmap";
+	std::string rocksdbPath = "/tmp/bingo-hashmap";
 	
 	std::cerr << "jae: ceph_str_hash_bingo: defined variables" << std::endl;
 	options.create_if_missing = true;
 	rocksdb::Status status = rocksdb::DB::Open(options, rocksdbPath, &db);
-	assert(status.ok());
+	// assert(status.ok());
+	if (!status.ok()) {
+		return 1;
+	}
 
 	std::cerr << "jae: ceph_str_hash_bingo: status.ok" << std::endl;
 	// read the pg num (value) of oid (key)
 	status = db->Get(rocksdb::ReadOptions(), oid, &value);
 	if (status.ok()) {
 		delete db;
+
+		std::stringstream valueStream(value);
+    getline(valueStream, value, ',');
+
 		std::cerr << "jae: ceph_str_hash_bingo: get existed value = " << value << std::endl;
 		return stoi(value);
 	}
@@ -119,7 +128,7 @@ unsigned ceph_str_hash_bingo(const char *str, unsigned length)
 		status = db->Get(rocksdb::ReadOptions(), keywanted, &value);
 		assert(status.ok());
 	}
-	status = db->Put(rocksdb::WriteOptions(), oid, value);
+	status = db->Put(rocksdb::WriteOptions(), oid, value + ",n");
 	std::cerr << "jae: ceph_str_hash_bingo: created KV(oid,pg)" << std::endl;
 
 	delete db;
@@ -144,6 +153,7 @@ unsigned ceph_str_hash_linux(const char *str, unsigned length)
 unsigned ceph_str_hash(int type, const char *s, unsigned len)
 {
 	unsigned int rtn;
+	std::cerr << "jae: ceph_str_hash" << std::endl;
 	switch (type) {
 	case CEPH_STR_HASH_LINUX:
 		return ceph_str_hash_linux(s, len);
